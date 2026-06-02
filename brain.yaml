@@ -1,0 +1,41 @@
+# --------------------------------------------------- Brain configuration
+brain:
+  neurons: 2000
+  head_size: 0
+  connections_per_neuron: 10
+  max_synapse_length: 0.3
+  weight_min: 0.0
+  weight_max: 1.0
+  total_input: 1000.0
+  seed: 42
+
+# --------------------------------------------------- Topology
+assembly:
+  - method: spiral
+    count: LAST
+    params: default
+
+# --------------------------------------------------- Inputs
+inputs:
+  - hunger:
+    center: 396
+    radius: 5
+    number: 50
+    eq_min: 0
+    eq_max: -100
+  - light:
+    center: 1000
+    radius: 10
+    number: 30
+    eq_min: 0
+    eq_max: -100
+
+# --------------------------------------------------- Outputs
+outputs:
+  - left_motor: [0, 1, 2, 3, 4]
+  - right_motor: [5, 6, 7, 8, 9]
+
+# --------------------------------------------------- Transfer function
+transfer_function:
+  time_step: 0.1
+  total_time: 100.0

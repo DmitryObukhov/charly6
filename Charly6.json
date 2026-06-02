@@ -1,0 +1,17 @@
+{
+  "tab": 0,
+  "params": {
+    "neurons": 5754,
+    "connections": 100,
+    "max_synapse": 0.8965000000000001,
+    "weight_min": -0.6590909090909092,
+    "weight_max": 1.9363636363636363,
+    "head_size": 100,
+    "total_input": "1000",
+    "seed": "",
+    "show_seq_lines": false,
+    "tick_ms": 1,
+    "max_iter": 49545,
+    "seq_window": 26
+  }
+}

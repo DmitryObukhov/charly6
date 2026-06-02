@@ -1,0 +1,10 @@
+tab: 0
+visualization:
+  display:
+    show_seq_lines: false
+    circle_radius: 3.0
+  runtime:
+    tick_ms: 100
+    max_iter: 0
+    seq_window: 9
+last_yaml: C:\PROJECT_42\__dev\Charly6\brain.yaml
