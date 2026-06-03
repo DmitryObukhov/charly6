@@ -41,6 +41,8 @@ src/charly6/
   brain.py          # Brain, Neuron, Substrate simulation engine
   diagram.py        # PHC/Hilbert canvas layout helpers
   app.py            # Tkinter root window, YAML config, visualization
+worlds/
+  linear.py         # first physical world module with stable function API
 tests/
 pyproject.toml
 ```
@@ -57,13 +59,26 @@ pyproject.toml
 
 - `app.py` owns the `tk.Tk` root and all top-level frames.
 - Brain YAML is edited in the Brain tab and may be loaded/saved through the File menu or tab buttons.
-- The app stores UI state in `charly6.config.yaml`, including selected tab, visualization controls, runtime controls, and `last_yaml`.
+- The app stores UI state in `charly6.config.yaml`, including selected tab, visualization/runtime values, and `last_yaml`.
 - Visualization settings may appear in legacy YAML files under `visualization`, `display`, or `runtime`, but they are stripped before saving brain YAML.
 - The canvas renders neurons using positions from YAML `assembly` steps. Active neurons are green, inactive neurons are dark, selected/input/head neurons have extra markers.
+- The Brain and World tabs each have a first `Default` button. Brain defaults come from `DEFAULT_BRAIN_CONFIG`; World defaults come from the selected plugin's `GetDefaultConfig`.
+- The World tab discovers plugins from `worlds/` by importing modules with `GetDefaultConfig`, shows them in a selector, and initializes/renders the selected or YAML `world.base` module.
+- Brain/world YAML loads and saves must validate required sections and report a specific error before accepting invalid YAML.
+- Compatibility is checked after editor changes: every brain input must be present in world outputs, and every world input must be present in brain outputs.
 - Runtime ticks use `root.after()`; no threads are used.
 - Current GUI step/tick callbacks apply input physical values, refresh output ratios/charts, and increment the iteration counter. They do not currently call `brain.process()`.
 - Right-click/click neuron interactions update the selected-neuron CAS, field editor, and input-connectome table.
 - Selected-neuron scalar fields (`eq`, `charge`, cumulative signal, elastic trigger delta, recharge, discharge, tiredness, and active) are editable from the GUI.
+
+### Physical world modules
+
+- World implementations live in `worlds/` and follow the prompt/API in `prompts/physical_world.txt`.
+- `worlds.linear` is the first implementation: a deterministic 2D visualization where the agent has one X coordinate, `stomach_content` in `0..10`, and moves left/right from normalized `left_motor` and `right_motor` inputs. It also has a `light` object with `x` and `brightness`.
+- World YAML uses one top-level `world` section for runtime and world settings (`base`, `dt`, `seed`, `input_validation`, `max_steps`, `dimensions`, `bounds`, `drag`); legacy top-level `simulation` remains readable but should not be emitted by defaults.
+- World `outputs` use mapping format: `output_name: source_field` (for example, `velocity: velocity`).
+- Keep the public API function names stable: `Init`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
+- `GetVisualization` returns the module's lightweight raster `Image` type, avoiding extra runtime dependencies beyond PyYAML.
 
 ### YAML model
 

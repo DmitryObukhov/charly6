@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import math
+import pkgutil
 import random
 import tkinter as tk
 from collections import deque
@@ -12,6 +14,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from charly6.brain import Brain, create_spatial_brain
 from charly6.diagram import hilbert_positions
+import worlds
 
 _MARGIN = 16.0
 # Dot caps are computed dynamically in _draw_brain as a fraction of neuron spacing.
@@ -310,10 +313,12 @@ class App(tk.Tk):
         self._seq_window: list[int] = []   # indices active in current brightness window
         self._seq_running: bool = False
         self._seq_tick_id: str | None = None
+        self._seq_label: ttk.Label | None = None
         self._circle_radius: float = 3.0
         # chart history (last 1000 ticks)
         self._act_history: deque[int] = deque(maxlen=1000)
         self._cas_neuron_idx: int | None = None
+        self._highlight_neuron_idx: int | None = None
         self._cas_charge: deque[float] = deque(maxlen=1000)
         self._cas_active: deque[float] = deque(maxlen=1000)
         self._cas_signal: deque[float] = deque(maxlen=1000)
@@ -328,6 +333,12 @@ class App(tk.Tk):
         self._neuron_fields_panel: dict = {}
         self._neuron_connectome_panel: dict = {}
         self._brain_yaml_path: Path | None = None
+        self._world_yaml_path: Path | None = None
+        self._world_initialized: bool = False
+        self._world_photo: tk.PhotoImage | None = None
+        self._world_plugins = self._discover_world_plugins()
+        self._world_model_var: tk.StringVar | None = None
+        self._world_module = self._world_plugins.get("worlds.linear") or next(iter(self._world_plugins.values()))
         self._build_menu()
         self._build_layout()
         self.state('zoomed')
@@ -336,12 +347,66 @@ class App(tk.Tk):
 
     # ── Menu ──────────────────────────────────────────────────────────────────
 
+    def _discover_world_plugins(self) -> dict[str, object]:
+        plugins: dict[str, object] = {}
+        for module_info in pkgutil.iter_modules(worlds.__path__, f"{worlds.__name__}."):
+            module = importlib.import_module(module_info.name)
+            if callable(getattr(module, "GetDefaultConfig", None)):
+                plugins[module_info.name] = module
+        if not plugins:
+            raise RuntimeError("No world plugins with GetDefaultConfig found.")
+        return dict(sorted(plugins.items()))
+
+    def _world_module_name_from_config(self, cfg: dict) -> str | None:
+        section = cfg.get("world", {})
+        if not isinstance(section, dict):
+            return None
+        raw_base = section.get("base")
+        if raw_base is None and isinstance(cfg.get("simulation"), dict):
+            raw_base = cfg["simulation"].get("base")
+        if not raw_base:
+            return None
+        base = str(raw_base).replace("\\", "/")
+        if base.endswith(".py"):
+            base = base[:-3]
+        return base.replace("/", ".")
+
+    def _world_module_for_config(self, cfg: dict):
+        module_name = self._world_module_name_from_config(cfg)
+        if module_name:
+            module = self._world_plugins.get(module_name)
+            if module is None:
+                try:
+                    module = importlib.import_module(module_name)
+                except ImportError as exc:
+                    raise ValueError(f"Unknown world plugin: {module_name}") from exc
+            if not callable(getattr(module, "GetDefaultConfig", None)):
+                raise ValueError(f"World plugin {module_name} does not define GetDefaultConfig.")
+            return module
+        return self._selected_world_module()
+
+    def _selected_world_module(self):
+        if self._world_model_var is not None:
+            name = self._world_model_var.get()
+            if name in self._world_plugins:
+                return self._world_plugins[name]
+        return self._world_module
+
+    def _select_world_module(self, module) -> None:
+        self._world_module = module
+        if self._world_model_var is not None:
+            self._world_model_var.set(module.__name__)
+
     def _build_menu(self) -> None:
         bar = tk.Menu(self)
         file_menu = tk.Menu(bar, tearoff=0)
         file_menu.add_command(label="Load brain YAML...", command=self._load_brain_yaml_dialog)
         file_menu.add_command(label="Save brain YAML", command=self._save_brain_yaml)
         file_menu.add_command(label="Save brain YAML as...", command=self._save_brain_yaml_dialog)
+        file_menu.add_separator()
+        file_menu.add_command(label="Load world YAML...", command=self._load_world_yaml_dialog)
+        file_menu.add_command(label="Save world YAML", command=self._save_world_yaml)
+        file_menu.add_command(label="Save world YAML as...", command=self._save_world_yaml_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
         bar.add_cascade(label="File", menu=file_menu)
@@ -406,6 +471,10 @@ class App(tk.Tk):
         self._bottom_nb.add(neuron_connectome_tab, text=" Neuron connectome ")
         self._neuron_connectome_panel = self._build_neuron_connectome_section(neuron_connectome_tab, row=0)
 
+        inputs_tab = ttk.Frame(self._bottom_nb)
+        self._bottom_nb.add(inputs_tab, text=" Inputs ")
+        self._build_inputs_tab(inputs_tab)
+
         self._bottom_nb.bind("<<NotebookTabChanged>>", lambda _: self._refresh_charts())
         self._build_execution_controls(left)
 
@@ -419,17 +488,14 @@ class App(tk.Tk):
         self._init_tab = ttk.Frame(self._notebook)
         self._runtime_tab = ttk.Frame(self._notebook)
         self._activity_tab = ttk.Frame(self._notebook)
-        self._inputs_tab = ttk.Frame(self._notebook)
 
         self._notebook.add(self._init_tab,    text="Brain")
         self._notebook.add(self._runtime_tab, text="World")
         self._notebook.add(self._activity_tab, text="Body")
-        self._notebook.add(self._inputs_tab, text="Inputs")
 
         self._build_init_tab()
         self._build_runtime_tab()
         self._build_activity_tab()
-        self._build_inputs_tab()
 
     # ── Tab: Initialization ───────────────────────────────────────────────────
 
@@ -470,6 +536,7 @@ class App(tk.Tk):
         )
         self._brain_yaml_editor.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self._set_brain_yaml_text(_dump_yaml(DEFAULT_BRAIN_CONFIG))
+        self._brain_yaml_editor.bind("<<Modified>>", self._on_yaml_editor_modified)
 
         self._yaml_path_label = ttk.Label(editor_frame, text="Unsaved YAML", foreground="gray", anchor="w")
         self._yaml_path_label.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
@@ -478,6 +545,7 @@ class App(tk.Tk):
 
         act = ttk.Frame(p)
         act.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Button(act, text="Default", command=self._load_default_brain_yaml).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Load YAML", command=self._load_brain_yaml_dialog).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Save YAML", command=self._save_brain_yaml).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Save YAML as...", command=self._save_brain_yaml_dialog).pack(side=tk.LEFT, padx=4)
@@ -490,6 +558,49 @@ class App(tk.Tk):
     def _build_runtime_tab(self) -> None:
         p = self._runtime_tab
         p.columnconfigure(0, weight=1)
+        p.rowconfigure(0, weight=1)
+        self._vars["tick_ms"] = tk.IntVar(value=100)
+        self._vars["max_iter"] = tk.IntVar(value=0)
+        self._vars["seq_window"] = tk.IntVar(value=9)
+        editor_frame = ttk.LabelFrame(p, text=" World config YAML ")
+        editor_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        editor_frame.rowconfigure(0, weight=1)
+        editor_frame.columnconfigure(0, weight=1)
+
+        self._world_yaml_editor = scrolledtext.ScrolledText(
+            editor_frame,
+            wrap=tk.NONE,
+            undo=True,
+            font=("Courier", 10),
+            height=24,
+        )
+        self._world_yaml_editor.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self._set_world_yaml_text(self._world_module.GetDefaultConfig())
+        self._world_yaml_editor.bind("<<Modified>>", self._on_yaml_editor_modified)
+
+        self._world_yaml_path_label = ttk.Label(editor_frame, text="Unsaved YAML", foreground="gray", anchor="w")
+        self._world_yaml_path_label.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+
+        act = ttk.Frame(p)
+        act.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Button(act, text="Default", command=self._load_default_world_yaml).pack(side=tk.LEFT, padx=4)
+        self._world_model_var = tk.StringVar(value=self._world_module.__name__)
+        ttk.Combobox(
+            act,
+            textvariable=self._world_model_var,
+            values=list(self._world_plugins),
+            state="readonly",
+            width=18,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(act, text="Load YAML", command=self._load_world_yaml_dialog).pack(side=tk.LEFT, padx=4)
+        ttk.Button(act, text="Save YAML", command=self._save_world_yaml).pack(side=tk.LEFT, padx=4)
+        ttk.Button(act, text="Save YAML as...", command=self._save_world_yaml_dialog).pack(side=tk.LEFT, padx=4)
+        ttk.Button(act, text="Init", command=self._on_world_initialize).pack(side=tk.RIGHT, padx=4)
+        self._world_status_label = ttk.Label(act, text="Not initialized", foreground="gray")
+        self._world_status_label.pack(side=tk.LEFT, padx=8)
+        self._compat_status_label = ttk.Label(act, text="", foreground="gray")
+        self._compat_status_label.pack(side=tk.LEFT, padx=8)
+        return
 
         sim = ttk.LabelFrame(p, text=" Simulation ")
         sim.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
@@ -540,8 +651,8 @@ class App(tk.Tk):
 
     # ── Widget helpers ────────────────────────────────────────────────────────
 
-    def _build_inputs_tab(self) -> None:
-        p = self._inputs_tab
+    def _build_inputs_tab(self, parent: tk.Widget) -> None:
+        p = parent
         p.columnconfigure(0, weight=1)
         p.rowconfigure(0, weight=1)
 
@@ -715,6 +826,8 @@ class App(tk.Tk):
         tree.configure(yscrollcommand=vsb.set)
         tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
+        tree.bind("<<TreeviewSelect>>", self._on_connectome_row_select)
+        tree.bind("<Double-1>", self._on_connectome_row_double_click)
 
         total_signal = ttk.Label(
             sel_lf, text="Total input signal:  —",
@@ -767,6 +880,8 @@ class App(tk.Tk):
         }
         if self._brain_yaml_path is not None:
             cfg["last_yaml"] = str(self._brain_yaml_path)
+        if self._world_yaml_path is not None:
+            cfg["last_world_yaml"] = str(self._world_yaml_path)
         return cfg
 
     def _get_visualization_config(self) -> dict:
@@ -793,6 +908,11 @@ class App(tk.Tk):
             path = Path(last_yaml)
             if path.exists():
                 self._load_brain_yaml(path, apply_visualization=False)
+        last_world_yaml = cfg.get("last_world_yaml")
+        if last_world_yaml:
+            path = Path(last_world_yaml)
+            if path.exists():
+                self._load_world_yaml(path)
 
         visualization = _visualization_config(cfg)
         if visualization:
@@ -827,11 +947,143 @@ class App(tk.Tk):
         return self._brain_yaml_editor.get("1.0", "end-1c")
 
     def _read_brain_yaml(self) -> dict:
-        data = _parse_yaml_text(self._brain_yaml_text())
+        return self._validate_brain_yaml_text(self._brain_yaml_text())
+
+    def _load_default_brain_yaml(self) -> None:
+        self._brain_yaml_path = None
+        self._set_brain_yaml_text(_dump_yaml(DEFAULT_BRAIN_CONFIG))
+        self._yaml_path_label.config(text="Unsaved YAML", foreground="gray")
+        self._status_label.config(text="Default YAML loaded", foreground="gray")
+        self._validate_model_compatibility()
+
+    def _validate_brain_yaml_text(self, text: str) -> dict:
+        data = _parse_yaml_text(text)
         if not isinstance(data, dict):
             raise ValueError("YAML root must be a mapping.")
         brain_cfg, _ = _split_visualization_sections(data)
+        self._validate_brain_config(brain_cfg)
         return brain_cfg
+
+    def _validate_brain_config(self, cfg: dict) -> None:
+        self._require_mapping_section(cfg, "brain")
+        self._require_section(cfg, "assembly")
+        self._require_section(cfg, "inputs")
+        self._require_section(cfg, "outputs")
+        brain_cfg = cfg["brain"]
+        target_n = self._yaml_int(brain_cfg, "neurons", minimum=1)
+        self._yaml_int(brain_cfg, "head_size", default=0, minimum=0)
+        self._yaml_int(brain_cfg, "connections_per_neuron", aliases=("connections",), default=10, minimum=0)
+        self._yaml_float(brain_cfg, "max_synapse_length", aliases=("max_synapse",), default=0.30, minimum=0.0)
+        self._yaml_float(brain_cfg, "weight_min", default=0.0)
+        self._yaml_float(brain_cfg, "weight_max", default=1.0)
+        self._yaml_float(brain_cfg, "total_input", default=1000.0)
+        positions = self._assembly_positions(cfg, target_n)
+        self._validate_input_specs(cfg, len(positions))
+        self._initialize_outputs(cfg, len(positions))
+
+    def _require_section(self, cfg: dict, name: str):
+        if name not in cfg:
+            raise ValueError(f"Missing required top-level section: {name}")
+        return cfg[name]
+
+    def _require_mapping_section(self, cfg: dict, name: str) -> dict:
+        section = self._require_section(cfg, name)
+        if not isinstance(section, dict):
+            raise ValueError(f"{name} must be a mapping.")
+        return section
+
+    def _validate_input_specs(self, cfg: dict, neuron_count: int) -> None:
+        raw_specs = self._require_section(cfg, "inputs")
+        if isinstance(raw_specs, dict):
+            raw_specs = [{name: spec} for name, spec in raw_specs.items()]
+        if not isinstance(raw_specs, list):
+            raise ValueError("inputs must be a list or mapping.")
+        for raw_spec in raw_specs:
+            name, spec = self._normalize_input_spec(raw_spec)
+            center = self._yaml_int(spec, "center", minimum=0)
+            self._yaml_int(spec, "radius", minimum=0)
+            self._yaml_int(spec, "number", minimum=0)
+            self._yaml_float(spec, "eq_min", default=0.0)
+            self._yaml_float(spec, "eq_max", default=0.0)
+            self._yaml_float(spec, "value", aliases=("physical_value",), default=0.0)
+            if center >= neuron_count:
+                raise ValueError(f"inputs.{name}.center must be < neuron count")
+
+    def _brain_interface_names(self, cfg: dict) -> tuple[set[str], set[str]]:
+        inputs = self._interface_names(cfg.get("inputs", []), self._normalize_input_spec)
+        outputs = self._interface_names(cfg.get("outputs", []), self._normalize_output_spec)
+        return inputs, outputs
+
+    def _interface_names(self, raw_specs, normalizer) -> set[str]:
+        if raw_specs is None:
+            return set()
+        if isinstance(raw_specs, dict):
+            raw_specs = [{name: spec} for name, spec in raw_specs.items()]
+        if not isinstance(raw_specs, list):
+            raise ValueError("interface specs must be a list or mapping.")
+        names: set[str] = set()
+        for raw_spec in raw_specs:
+            name, _ = normalizer(raw_spec)
+            names.add(name)
+        return names
+
+    def _validate_world_yaml_text(self, text: str) -> dict:
+        data = _parse_yaml_text(text)
+        if not isinstance(data, dict):
+            raise ValueError("YAML root must be a mapping.")
+        for section in ("world", "objects", "inputs", "outputs"):
+            if section not in data:
+                raise ValueError(f"Missing required top-level section: {section}")
+        module = self._world_module_for_config(data)
+        parser = getattr(module, "_parse_config", None)
+        if callable(parser):
+            parser(text)
+        return data
+
+    def _world_interface_names(self, cfg: dict) -> tuple[set[str], set[str]]:
+        inputs = {str(item.get("name", "")).strip() for item in cfg.get("inputs", []) if isinstance(item, dict)}
+        raw_outputs = cfg.get("outputs", [])
+        if isinstance(raw_outputs, dict):
+            outputs = {str(name).strip() for name in raw_outputs}
+        else:
+            outputs = {str(item.get("name", "")).strip() for item in raw_outputs if isinstance(item, dict)}
+        return {name for name in inputs if name}, {name for name in outputs if name}
+
+    def _on_yaml_editor_modified(self, event: tk.Event) -> None:
+        widget = event.widget
+        if not widget.edit_modified():
+            return
+        widget.edit_modified(False)
+        self._validate_model_compatibility()
+
+    def _validate_model_compatibility(self) -> bool:
+        if not hasattr(self, "_compat_status_label"):
+            return False
+        try:
+            brain_cfg = self._validate_brain_yaml_text(self._brain_yaml_text())
+        except ValueError as exc:
+            self._compat_status_label.config(text=f"Brain YAML: {exc}", foreground="red")
+            return False
+        try:
+            world_cfg = self._validate_world_yaml_text(self._world_yaml_text())
+        except ValueError as exc:
+            self._compat_status_label.config(text=f"World YAML: {exc}", foreground="red")
+            return False
+
+        brain_inputs, brain_outputs = self._brain_interface_names(brain_cfg)
+        world_inputs, world_outputs = self._world_interface_names(world_cfg)
+        missing_world_outputs = sorted(brain_inputs - world_outputs)
+        missing_brain_outputs = sorted(world_inputs - brain_outputs)
+        if missing_world_outputs or missing_brain_outputs:
+            parts = []
+            if missing_world_outputs:
+                parts.append(f"world outputs missing: {', '.join(missing_world_outputs)}")
+            if missing_brain_outputs:
+                parts.append(f"brain outputs missing: {', '.join(missing_brain_outputs)}")
+            self._compat_status_label.config(text="Incompatible: " + "; ".join(parts), foreground="red")
+            return False
+        self._compat_status_label.config(text="Compatible", foreground="green")
+        return True
 
     def _load_brain_yaml_dialog(self) -> None:
         p = filedialog.askopenfilename(
@@ -844,10 +1096,8 @@ class App(tk.Tk):
     def _load_brain_yaml(self, path: Path, *, apply_visualization: bool = True) -> None:
         try:
             text = path.read_text(encoding="utf-8")
-            cfg = _parse_yaml_text(text)
-            if not isinstance(cfg, dict):
-                raise ValueError("YAML root must be a mapping.")
-            _, visualization = _split_visualization_sections(cfg)
+            self._validate_brain_yaml_text(text)
+            _, visualization = _split_visualization_sections(_parse_yaml_text(text))
         except (OSError, ValueError) as exc:
             messagebox.showerror("Load YAML", f"Could not load YAML:\n{exc}")
             return
@@ -861,6 +1111,7 @@ class App(tk.Tk):
         if apply_visualization and visualization:
             self._apply_visualization_config(visualization)
         self._save_config(CONFIG_PATH)
+        self._validate_model_compatibility()
 
     def _save_brain_yaml(self) -> None:
         if self._brain_yaml_path is None:
@@ -880,9 +1131,8 @@ class App(tk.Tk):
     def _write_brain_yaml(self, path: Path) -> None:
         try:
             text = self._brain_yaml_text()
+            self._validate_brain_yaml_text(text)
             data = _parse_yaml_text(text)
-            if not isinstance(data, dict):
-                raise ValueError("YAML root must be a mapping.")
             _, visualization = _split_visualization_sections(data)
             text_to_write = (
                 _strip_top_level_sections(text, ("visualization", "display", "runtime"))
@@ -897,6 +1147,77 @@ class App(tk.Tk):
         self._brain_yaml_path = path
         self._yaml_path_label.config(text=str(path), foreground="gray")
         self._save_config(CONFIG_PATH)
+        self._validate_model_compatibility()
+
+    def _set_world_yaml_text(self, text: str) -> None:
+        self._world_yaml_editor.delete("1.0", tk.END)
+        self._world_yaml_editor.insert("1.0", text)
+        self._world_yaml_editor.edit_modified(False)
+
+    def _world_yaml_text(self) -> str:
+        return self._world_yaml_editor.get("1.0", "end-1c")
+
+    def _load_default_world_yaml(self) -> None:
+        module = self._selected_world_module()
+        self._select_world_module(module)
+        self._world_yaml_path = None
+        self._world_initialized = False
+        self._set_world_yaml_text(module.GetDefaultConfig())
+        self._world_yaml_path_label.config(text="Unsaved YAML", foreground="gray")
+        self._world_status_label.config(text=f"Default YAML loaded ({module.__name__})", foreground="gray")
+        self._validate_model_compatibility()
+        self._draw_world()
+
+    def _load_world_yaml_dialog(self) -> None:
+        p = filedialog.askopenfilename(
+            filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")],
+            defaultextension=".yaml",
+        )
+        if p:
+            self._load_world_yaml(Path(p))
+
+    def _load_world_yaml(self, path: Path) -> None:
+        try:
+            text = path.read_text(encoding="utf-8")
+            data = self._validate_world_yaml_text(text)
+            module = self._world_module_for_config(data)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Load world YAML", f"Could not load YAML:\n{exc}")
+            return
+        self._select_world_module(module)
+        self._world_yaml_path = path
+        self._set_world_yaml_text(text)
+        self._world_yaml_path_label.config(text=str(path), foreground="gray")
+        self._save_config(CONFIG_PATH)
+        self._validate_model_compatibility()
+
+    def _save_world_yaml(self) -> None:
+        if self._world_yaml_path is None:
+            self._save_world_yaml_dialog()
+            return
+        self._write_world_yaml(self._world_yaml_path)
+
+    def _save_world_yaml_dialog(self) -> None:
+        p = filedialog.asksaveasfilename(
+            filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")],
+            defaultextension=".yaml",
+            initialfile="world.yaml",
+        )
+        if p:
+            self._write_world_yaml(Path(p))
+
+    def _write_world_yaml(self, path: Path) -> None:
+        try:
+            text = self._world_yaml_text()
+            self._validate_world_yaml_text(text)
+            path.write_text(text, encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Save world YAML", f"Could not save YAML:\n{exc}")
+            return
+        self._world_yaml_path = path
+        self._world_yaml_path_label.config(text=str(path), foreground="gray")
+        self._save_config(CONFIG_PATH)
+        self._validate_model_compatibility()
 
     def _apply_visualization_config(self, visualization: dict) -> None:
         display = visualization.get("display", {})
@@ -934,11 +1255,41 @@ class App(tk.Tk):
         self._draw_brain()
 
     def _on_world_resize(self, event: tk.Event) -> None:
+        self._draw_world()
+
+    def _draw_world(self) -> None:
         c = self._world_canvas
+        width = c.winfo_width()
+        height = c.winfo_height()
         c.delete("all")
-        if event.width > 1 and event.height > 1:
-            c.create_text(event.width // 2, event.height // 2,
+        if width <= 1 or height <= 1:
+            return
+        if not self._world_initialized:
+            c.create_text(width // 2, height // 2,
                           text="World visualization", fill="#3d4451", font=("Helvetica", 14))
+            return
+        try:
+            image = self._world_module.GetVisualization((width, height))
+            params = self._world_module.GetParams()
+        except (RuntimeError, ValueError) as exc:
+            self._world_initialized = False
+            c.create_text(width // 2, height // 2, text=str(exc), fill="#ef4444", font=("Helvetica", 11))
+            return
+        photo = tk.PhotoImage(width=image.width, height=image.height)
+        rows = []
+        for row in image.pixels:
+            rows.append("{" + " ".join(f"#{r:02x}{g:02x}{b:02x}" for r, g, b in row) + "}")
+        photo.put(" ".join(rows))
+        self._world_photo = photo
+        c.create_image(0, 0, image=photo, anchor="nw")
+        c.create_text(
+            12,
+            10,
+            text=f"x={float(params['x']):.3f}   velocity={float(params['velocity']):.3f}",
+            fill="#d1d5db",
+            font=("Courier", 10),
+            anchor="nw",
+        )
 
     # ── Brain rendering ───────────────────────────────────────────────────────
 
@@ -1029,7 +1380,14 @@ class App(tk.Tk):
                 fill = color if neuron.active else ""
                 c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=color, width=1)
 
-        # White highlight ring drawn on top of the selected neuron
+        # Highlight rings drawn on top of neurons
+        hi = self._highlight_neuron_idx
+        if hi is not None and hi < len(self._positions):
+            hx, hy = tc(*self._positions[hi])
+            if -60 < hx < W + 60 and -60 < hy < H + 60:
+                hr = min(max(self._circle_radius + 5, 8), 42.0)
+                c.create_oval(hx - hr, hy - hr, hx + hr, hy + hr,
+                              fill="", outline="#f59e0b", width=3)
         if sel is not None and sel < len(self._positions):
             sx, sy = tc(*self._positions[sel])
             if -60 < sx < W + 60 and -60 < sy < H + 60:
@@ -1124,6 +1482,7 @@ class App(tk.Tk):
             self._clear_neuron_selection()
             return
         if self._cas_neuron_idx != idx:
+            self._highlight_neuron_idx = None
             self._cas_charge.clear()
             self._cas_active.clear()
             self._cas_signal.clear()
@@ -1197,6 +1556,7 @@ class App(tk.Tk):
         if self._cas_neuron_idx is None:
             return
         self._cas_neuron_idx = None
+        self._highlight_neuron_idx = None
         self._cas_charge.clear()
         self._cas_active.clear()
         self._cas_signal.clear()
@@ -1231,6 +1591,60 @@ class App(tk.Tk):
             f"active={neu.active}   eq={neu.eq:.3f}   charge={neu.charge:.3f}   "
             f"tiredness={neu.tiredness:.3f}   cumulative={neu.cumulative_signal:.3f}"
         ))
+
+    def _on_connectome_row_select(self, event: tk.Event) -> None:
+        tree = event.widget
+        selected = tree.selection()
+        if not selected:
+            self._highlight_neuron_idx = None
+            self._draw_brain()
+            return
+        values = tree.item(selected[0], "values")
+        try:
+            self._highlight_neuron_idx = int(values[0])
+        except (IndexError, TypeError, ValueError):
+            self._highlight_neuron_idx = None
+        self._draw_brain()
+
+    def _on_connectome_row_double_click(self, event: tk.Event) -> None:
+        if self._brain is None:
+            return
+        tree = event.widget
+        item_id = tree.identify_row(event.y)
+        if item_id:
+            tree.selection_set(item_id)
+            values = tree.item(item_id, "values")
+        else:
+            selected = tree.selection()
+            if not selected:
+                return
+            values = tree.item(selected[0], "values")
+        try:
+            src_idx = int(values[0])
+        except (IndexError, TypeError, ValueError):
+            return
+        if src_idx < 0 or src_idx >= len(self._brain.substrate.brain):
+            return
+        neuron = self._brain.substrate.brain[src_idx]
+        neuron.active = not neuron.active
+        self._highlight_neuron_idx = src_idx
+        selected_idx = self._cas_neuron_idx
+        if selected_idx is not None:
+            self._update_neuron_panel(selected_idx)
+            self._select_connectome_source(src_idx)
+        self._draw_brain()
+        self._draw_cas()
+        self._refresh_output_values()
+
+    def _select_connectome_source(self, src_idx: int) -> None:
+        tree = self._neuron_connectome_panel["tree"]
+        for item_id in tree.get_children():
+            values = tree.item(item_id, "values")
+            if values and str(values[0]) == str(src_idx):
+                tree.selection_set(item_id)
+                tree.focus(item_id)
+                tree.see(item_id)
+                return
 
     def _on_seq_start(self) -> None:
         if self._seq_running or not self._positions:
@@ -1281,6 +1695,8 @@ class App(tk.Tk):
         self._seq_tick_id = self.after(int(self._vars["tick_ms"].get()), self._seq_tick)
 
     def _update_seq_label(self) -> None:
+        if self._seq_label is None:
+            return
         total = len(self._positions)
         if total:
             self._seq_label.config(text=f"Step: {self._seq_cursor} / {total}")
@@ -1288,6 +1704,24 @@ class App(tk.Tk):
             self._seq_label.config(text="Step: —")
 
     # ── Simulation callbacks (stubs) ──────────────────────────────────────────
+
+    def _on_world_initialize(self) -> None:
+        try:
+            text = self._world_yaml_text()
+            data = self._validate_world_yaml_text(text)
+            module = self._world_module_for_config(data)
+            module.Init(text)
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("World init", f"Invalid world YAML:\n{exc}")
+            self._world_initialized = False
+            self._world_status_label.config(text="Invalid YAML", foreground="red")
+            self._draw_world()
+            return
+        self._world_initialized = True
+        self._select_world_module(module)
+        self._world_status_label.config(text="Initialized", foreground="green")
+        self._validate_model_compatibility()
+        self._draw_world()
 
     def _on_initialize(self) -> None:
         try:
@@ -1370,6 +1804,7 @@ class App(tk.Tk):
         self._cas_active.clear()
         self._cas_signal.clear()
         self._cas_neuron_idx = None
+        self._highlight_neuron_idx = None
         self._neuron_info_label.config(text="")
         self._iteration = 0
         self._status_label.config(

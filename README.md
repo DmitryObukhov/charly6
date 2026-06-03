@@ -42,6 +42,14 @@ Brain YAML supports these top-level sections:
 - `outputs`: named output groups, each mapped to neuron indices.
 - `transfer_function`: currently parsed as YAML content but not used by the GUI runtime.
 
+## Physical Worlds
+
+Physical world implementations live in `worlds/` and expose the stable API described by `prompts/physical_world.txt`: `Init`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
+
+The first implementation is `worlds.linear`, a deterministic 2D visualization with a single agent coordinate on the X axis, a `light` object (`x`, `brightness`), and agent `stomach_content` in the range `0..10`. Its YAML keeps runtime settings such as `base`, `dt`, `seed`, `input_validation`, and `max_steps` inside the top-level `world` section. It accepts normalized `left_motor` and `right_motor` inputs, advances one physics step per `Process` call, and returns float observations such as `velocity`, `hunger`, and `light`.
+
+World outputs use mapping format: `output_name: source_field`, for example `velocity: velocity`.
+
 Example:
 
 ```yaml
@@ -74,11 +82,13 @@ outputs:
 
 ## Interface
 
-- `Brain` tab: edit/load/save brain YAML and initialize the network.
-- `World` tab: adjust runtime tick interval, maximum iterations, sequence-line display, neuron radius, and head-sequence controls.
+- `Brain` tab: generate default brain YAML, edit/load/save brain YAML, and initialize the network.
+- `World` tab: select a world plugin, generate its default YAML through `GetDefaultConfig`, edit/load/save world YAML, and initialize the physical world.
 - `Body` tab: view basic statistics.
-- `Inputs` tab: edit input physical values and read output group activation ratios.
-- Bottom tabs: inspect the world view, selected-neuron CAS chart, active-count chart, neuron fields, and selected-neuron input connectome.
+- Lower `Inputs` tab: edit input physical values and read output group activation ratios.
+- Bottom tabs: inspect the world view, selected-neuron CAS chart, active-count chart, neuron fields, selected-neuron input connectome, and inputs/outputs.
+
+Brain/world YAML is validated when loaded or saved. The editors also check model compatibility after changes: brain input names must be available as world output names, and world input names must be available as brain output names.
 
 Right-click or click neurons in the brain canvas to inspect state. Editable selected-neuron fields are applied on Enter or focus loss.
 

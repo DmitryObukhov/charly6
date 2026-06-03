@@ -1,0 +1,37 @@
+world:
+  base: worlds/linear.py
+  dt: 0.1
+  seed: 42
+  input_validation: strict
+  max_steps: null
+  dimensions: 2
+  bounds:
+    x: [-10.0, 10.0]
+    y: [0.0, 1.0]
+  drag: 0.05
+
+objects:
+  - name: agent
+    shape: triangle
+    mass: 1.0
+    radius: 0.5
+    position: [0.0]
+    velocity: [0.0]
+    restitution: 0.2
+    stomach_content: 10.0
+  - name: light
+    x: 5.0
+    brightness: 10.0
+
+inputs:
+  - name: left_motor
+    min: 0.0
+    max: 10.0
+  - name: right_motor
+    min: 0.0
+    max: 10.0
+
+outputs:
+  velocity: velocity
+  hunger: hunger
+  light: lightness
