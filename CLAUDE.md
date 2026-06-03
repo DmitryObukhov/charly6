@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Charly6 is a Python GUI application for neuromorphic network simulation and training. It is the GUI successor to `../charcir` (a CLI-only visualizer). The simulation engine concepts (Brain, Neuron, Substrate, connectome) originate there and should be reused or adapted.
+Charly6 is a Python GUI application for building, visualizing, and inspecting neuromorphic network layouts. It loads a YAML brain definition, creates a spatial connectome, renders the network in Tkinter, and exposes input/output groups plus selected-neuron state and connectome inspection panels.
 
-**Stack:** Python 3.14+, Tkinter (stdlib GUI), pytest, ruff. No third-party runtime dependencies.
+**Stack:** Python 3.14, Tkinter, PyYAML, pytest, ruff.
 
 ## Setup
 
@@ -21,10 +21,10 @@ py -3.14 -m venv .venv
 ```powershell
 # Run the app
 .\.venv\Scripts\python -m charly6
+.\.venv\Scripts\python run.py
 
 # Tests
 .\.venv\Scripts\python -m pytest
-.\.venv\Scripts\python -m pytest tests/test_brain.py   # single file
 
 # Lint
 .\.venv\Scripts\python -m ruff check .
@@ -32,41 +32,51 @@ py -3.14 -m venv .venv
 
 ## Architecture
 
-Use `src/charly6/` layout (matching `charcir`):
+Use `src/charly6/` layout:
 
-```
+```text
 src/charly6/
   __init__.py       # public exports
   __main__.py       # python -m charly6 entrypoint
   brain.py          # Brain, Neuron, Substrate simulation engine
-  diagram.py        # canvas layout helpers
-  app.py            # Tkinter root window, main loop
-  trainer.py        # training loop, learning rules, reward signals
+  diagram.py        # PHC/Hilbert canvas layout helpers
+  app.py            # Tkinter root window, YAML config, visualization
 tests/
 pyproject.toml
 ```
 
-### Simulation engine (from charcir)
+### Simulation engine
 
-- **`Brain`** owns a `Substrate` (list of `Neuron` + connectome `list[tuple[src, dst, weight]]`).
-- One call to `brain.process()` propagates signals: active neurons (charge ≥ threshold) push `charge * weight` to their destinations, then each neuron discharges or recharges and updates `active`.
-- `brain.get_inputs(signals)` injects floats into the first N neurons; `brain.set_outputs(indices)` reads boolean activations.
+- `Brain` owns a `Substrate` with `brain: list[Neuron]` and `connectome: list[tuple[src, dst, weight]]`.
+- One call to `brain.process()` propagates signals from active neurons, applies recharge/discharge, updates `active`, and appends neuron history.
+- `brain.get_inputs(signals)` injects floats into the first N neurons.
+- `brain.set_outputs(indices)` reads boolean activations.
+- Factory functions are `create_random_brain()` and `create_spatial_brain()`.
 
 ### GUI layer
 
 - `app.py` owns the `tk.Tk` root and all top-level frames.
-- The canvas renders neurons as a circle diagram (see `charcir/src/charcir/diagram.py` for the layout math). Active neurons are green, inactive are black.
-- The GUI drives the simulation via `root.after()` ticks — no threads for the sim loop.
+- Brain YAML is edited in the Brain tab and may be loaded/saved through the File menu or tab buttons.
+- The app stores UI state in `charly6.config.yaml`, including selected tab, visualization controls, runtime controls, and `last_yaml`.
+- Visualization settings may appear in legacy YAML files under `visualization`, `display`, or `runtime`, but they are stripped before saving brain YAML.
+- The canvas renders neurons using positions from YAML `assembly` steps. Active neurons are green, inactive neurons are dark, selected/input/head neurons have extra markers.
+- Runtime ticks use `root.after()`; no threads are used.
+- Current GUI step/tick callbacks apply input physical values, refresh output ratios/charts, and increment the iteration counter. They do not currently call `brain.process()`.
+- Right-click/click neuron interactions update the selected-neuron CAS, field editor, and input-connectome table.
+- Selected-neuron scalar fields (`eq`, `charge`, cumulative signal, elastic trigger delta, recharge, discharge, tiredness, and active) are editable from the GUI.
 
-### Training layer
+### YAML model
 
-- `trainer.py` wraps a `Brain` and implements learning rules (e.g., Hebbian, STDP, reward-modulated).
-- Training state (weights, iteration count, loss curve) is separate from the `Brain` dataclass so the sim engine stays pure.
+- `brain`: supports `neurons`, `head_size`, `connections_per_neuron`/`connections`, `max_synapse_length`/`max_synapse`, `weight_min`, `weight_max`, `total_input`, and `seed`.
+- `assembly`: list of layout steps. Supported methods are `phc`, `spiral`, and `straight`/`stright`. Steps support `method`, `count`, and `params`/`options`; a `count` of `LAST` fills the remaining `brain.neurons`.
+- `inputs`: list or mapping of named inputs. Each input supports `center`, `radius`, `number`, `eq_min`, `eq_max`, and `value`/`physical_value`.
+- `outputs`: list or mapping of named output groups. Outputs can specify indices as a list, comma-separated string, or aliases `indices`, `actuators`, or `neurons`.
+- `transfer_function` may appear in YAML, but the current GUI does not consume it.
 
-## Key conventions from charcir
+## Key conventions
 
-- Dataclasses with `slots=True` for all data structures.
+- Dataclasses with `slots=True` for data structures.
 - `Neuron` fields: `active`, `eq`, `charge`, `cumulative_signal`, `elastic_trigger_delta`, `elastic_recharge`, `cyclic_discharge`, `tiredness`, `history_table`.
-- Connectome is `list[tuple[int, int, float]]` — `(src_idx, dst_idx, weight)`.
-- Factory functions (`create_random_brain`, `create_ring_brain`) return fully initialized `Brain` objects.
-- All config via constructor args; no global mutable state.
+- Connectome is `list[tuple[int, int, float]]`: `(src_idx, dst_idx, weight)`.
+- Spatial connectomes are generated destination-first from nearby source neurons and normalized so each destination receives `total_input` aggregate incoming weight.
+- Keep simulation engine state in dataclasses and pass config through constructor/function arguments rather than global mutable state.

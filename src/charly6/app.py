@@ -2054,7 +2054,8 @@ class App(tk.Tk):
         vmin = y_min if y_min is not None else (min(vals) if vals else 0.0)
         vmax = y_max if y_max is not None else (max(vals) if vals else 1.0)
         if vmin == vmax:
-            vmin -= 0.5; vmax += 0.5
+            vmin -= 0.5
+            vmax += 0.5
 
         for frac, val in ((0.0, vmax), (0.5, (vmin + vmax) / 2), (1.0, vmin)):
             ty = ay0 + frac * ph

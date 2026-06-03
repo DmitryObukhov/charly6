@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "charly6"
 version = "0.1.0"
-description = "Neuromorphic network simulation and training GUI."
+description = "Neuromorphic network visualization and inspection GUI."
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "PyYAML>=6.0.0",
