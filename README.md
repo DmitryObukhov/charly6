@@ -44,7 +44,7 @@ Brain YAML supports these top-level sections:
 
 ## Physical Worlds
 
-Physical world implementations live in `worlds/` and expose the stable API described by `prompts/physical_world.txt`: `Init`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
+Physical world implementations live in `worlds/` and expose the stable API described by `prompts/physical_world.md`: `Init`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
 
 The first implementation is `worlds.linear`, a deterministic 2D visualization with a single agent coordinate on the X axis, a `light` object (`x`, `brightness`), and agent `stomach_content` in the range `0..10`. Its YAML keeps runtime settings such as `base`, `dt`, `seed`, `input_validation`, and `max_steps` inside the top-level `world` section. It accepts normalized `left_motor` and `right_motor` inputs, advances one physics step per `Process` call, and returns float observations such as `velocity`, `hunger`, and `light`.
 

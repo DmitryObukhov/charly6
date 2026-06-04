@@ -73,7 +73,7 @@ pyproject.toml
 
 ### Physical world modules
 
-- World implementations live in `worlds/` and follow the prompt/API in `prompts/physical_world.txt`.
+- World implementations live in `worlds/` and follow the prompt/API in `prompts/physical_world.md`.
 - `worlds.linear` is the first implementation: a deterministic 2D visualization where the agent has one X coordinate, `stomach_content` in `0..10`, and moves left/right from normalized `left_motor` and `right_motor` inputs. It also has a `light` object with `x` and `brightness`.
 - World YAML uses one top-level `world` section for runtime and world settings (`base`, `dt`, `seed`, `input_validation`, `max_steps`, `dimensions`, `bounds`, `drag`); legacy top-level `simulation` remains readable but should not be emitted by defaults.
 - World `outputs` use mapping format: `output_name: source_field` (for example, `velocity: velocity`).
