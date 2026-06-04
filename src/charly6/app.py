@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import pkgutil
 import random
+import re
 import tkinter as tk
 from collections import deque
 from datetime import datetime
@@ -20,6 +22,8 @@ _MARGIN = 16.0
 # Dot caps are computed dynamically in _draw_brain as a fraction of neuron spacing.
 
 CONFIG_PATH = Path("charly6.config.yaml")
+LOG_DIR = Path("logs")
+RUNTIME_DIR = Path("runtime")
 
 try:
     import yaml
@@ -28,6 +32,7 @@ except ImportError:  # pragma: no cover - exercised only when PyYAML is absent.
 
 
 DEFAULT_BRAIN_CONFIG: dict = {
+    "ID": "charly_6_1",
     "brain": {
         "neurons": 3000,
         "head_size": 0,
@@ -37,6 +42,9 @@ DEFAULT_BRAIN_CONFIG: dict = {
         "weight_max": 1.0,
         "total_input": 1000.0,
         "seed": None,
+        "NUMBER_OF_LAYERS": 1,
+        "HISTORY_DEPTH": 32,
+        "CHARGE_MAX": 100.0,
     },
     "assembly": [
         {
@@ -89,6 +97,33 @@ def _dump_yaml(data: dict) -> str:
     if yaml is not None:
         return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     return _dump_simple_yaml(data)
+
+
+def _brain_id_from_config(cfg: dict) -> str:
+    raw_id = cfg.get("ID")
+    if raw_id is None:
+        raise ValueError("Missing required top-level section: ID")
+    brain_id = str(raw_id).strip()
+    if not brain_id:
+        raise ValueError("ID must not be empty.")
+    return brain_id
+
+
+def _runtime_safe_id(brain_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", brain_id.strip())
+    safe = safe.strip("._")
+    if not safe:
+        raise ValueError("ID must contain at least one filename-safe character.")
+    return safe
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, separators=(",", ":"))
+        file.write("\n")
+    tmp_path.replace(path)
 
 
 def _split_visualization_sections(cfg: dict) -> tuple[dict, dict]:
@@ -299,6 +334,8 @@ class App(tk.Tk):
         self._tick_id: str | None = None
         self._iteration: int = 0
         self._brain: Brain | None = None
+        self._brain_id: str | None = None
+        self._runtime_active_overrides: dict[int, bool] = {}
         self._positions: list[tuple[float, float]] = []
         self._in_counts: list[int] = []
         self._out_counts: list[int] = []
@@ -339,8 +376,15 @@ class App(tk.Tk):
         self._world_plugins = self._discover_world_plugins()
         self._world_model_var: tk.StringVar | None = None
         self._world_module = self._world_plugins.get("worlds.linear") or next(iter(self._world_plugins.values()))
+        self._log_path = self._create_log_path()
+        self._log_lines: list[str] = []
+        self._log_text: scrolledtext.ScrolledText | None = None
+        self._log_filter_var = tk.StringVar(value="")
+        self._log_search_var = tk.StringVar(value="")
+        self._log_status_var = tk.StringVar(value="")
         self._build_menu()
         self._build_layout()
+        self._log(f"Opened log {self._log_path}")
         self.state('zoomed')
         self._load_config(CONFIG_PATH)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -488,14 +532,17 @@ class App(tk.Tk):
         self._init_tab = ttk.Frame(self._notebook)
         self._runtime_tab = ttk.Frame(self._notebook)
         self._activity_tab = ttk.Frame(self._notebook)
+        self._log_tab = ttk.Frame(self._notebook)
 
         self._notebook.add(self._init_tab,    text="Brain")
         self._notebook.add(self._runtime_tab, text="World")
         self._notebook.add(self._activity_tab, text="Body")
+        self._notebook.add(self._log_tab, text="Log")
 
         self._build_init_tab()
         self._build_runtime_tab()
         self._build_activity_tab()
+        self._build_log_tab()
 
     # ── Tab: Initialization ───────────────────────────────────────────────────
 
@@ -649,7 +696,148 @@ class App(tk.Tk):
         self._activity_canvas = tk.Canvas(chart_frame, bg="#0d1117")
         self._activity_canvas.grid(row=0, column=0, sticky="nsew")
 
+    def _build_log_tab(self) -> None:
+        p = self._log_tab
+        p.columnconfigure(0, weight=1)
+        p.rowconfigure(1, weight=1)
+
+        controls = ttk.Frame(p)
+        controls.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+
+        ttk.Label(controls, text="Search").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        search = ttk.Entry(controls, textvariable=self._log_search_var)
+        search.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(controls, text="Filter").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        regex_filter = ttk.Entry(controls, textvariable=self._log_filter_var)
+        regex_filter.grid(row=0, column=3, sticky="ew")
+
+        self._log_status_label = ttk.Label(p, textvariable=self._log_status_var, foreground="gray", anchor="w")
+        self._log_status_label.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        self._log_text = scrolledtext.ScrolledText(
+            p,
+            wrap=tk.NONE,
+            undo=False,
+            font=("Courier", 9),
+            height=24,
+            state=tk.DISABLED,
+        )
+        self._log_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self._log_text.tag_configure("search_match", background="#facc15", foreground="#111827")
+        self._log_filter_var.trace_add("write", lambda *_: self._refresh_log_view())
+        self._log_search_var.trace_add("write", lambda *_: self._refresh_log_view())
+        self._refresh_log_view()
+
     # ── Widget helpers ────────────────────────────────────────────────────────
+
+    def _create_log_path(self) -> Path:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = LOG_DIR / f"{timestamp}.log"
+        counter = 1
+        while path.exists():
+            path = LOG_DIR / f"{timestamp}_{counter}.log"
+            counter += 1
+        path.touch()
+        return path
+
+    def _runtime_state_paths(self) -> tuple[Path, Path]:
+        if self._brain_id is None:
+            raise ValueError("Brain ID is not set.")
+        safe_id = _runtime_safe_id(self._brain_id)
+        return RUNTIME_DIR / f"{safe_id}_neurons", RUNTIME_DIR / f"{safe_id}_connectome"
+
+    def _save_runtime_state(self) -> None:
+        if self._brain is None:
+            return
+        try:
+            neurons_path, connectome_path = self._runtime_state_paths()
+            metadata = {
+                "id": self._brain_id,
+                "iteration_idx": self._brain.iteration_idx,
+                "ui_iteration": self._iteration,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _write_json_atomic(neurons_path, {
+                **metadata,
+                "format": "charly6.neurons.v1",
+                "count": len(self._brain.substrate.brain),
+                "neurons": [neuron.to_dict() for neuron in self._brain.substrate.brain],
+            })
+            _write_json_atomic(connectome_path, {
+                **metadata,
+                "format": "charly6.connectome.v1",
+                "count": len(self._brain.substrate.connectome),
+                "connectome": [
+                    [src_idx, dst_idx, weight]
+                    for src_idx, dst_idx, weight in self._brain.substrate.connectome
+                ],
+            })
+        except (OSError, ValueError) as exc:
+            self._log(f"Runtime state save failed: {exc}")
+
+    def _log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{timestamp}  {message}"
+        self._log_lines.append(line)
+        try:
+            with self._log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except OSError as exc:
+            self._log_status_var.set(f"Could not write log: {exc}")
+        self._refresh_log_view()
+
+    def _refresh_log_view(self) -> None:
+        text = self._log_text
+        if text is None:
+            return
+
+        lines = self._log_lines
+        filter_pattern = self._log_filter_var.get().strip()
+        search_pattern = self._log_search_var.get().strip()
+        status = f"Current log: {self._log_path}"
+
+        if filter_pattern:
+            try:
+                filter_regex = re.compile(filter_pattern)
+            except re.error as exc:
+                lines = []
+                status = f"Invalid filter regex: {exc}"
+            else:
+                lines = [line for line in lines if filter_regex.search(line)]
+
+        rendered = "\n".join(lines)
+        if rendered:
+            rendered += "\n"
+
+        text.configure(state=tk.NORMAL)
+        text.delete("1.0", tk.END)
+        text.insert("1.0", rendered)
+        text.tag_remove("search_match", "1.0", tk.END)
+
+        if search_pattern:
+            try:
+                search_regex = re.compile(search_pattern)
+            except re.error as exc:
+                status = f"Invalid search regex: {exc}"
+            else:
+                self._highlight_log_matches(search_regex)
+
+        text.configure(state=tk.DISABLED)
+        self._log_status_var.set(status)
+        text.see(tk.END)
+
+    def _highlight_log_matches(self, regex: re.Pattern[str]) -> None:
+        text = self._log_text
+        if text is None:
+            return
+        content = text.get("1.0", "end-1c")
+        for match in regex.finditer(content):
+            if match.start() == match.end():
+                continue
+            text.tag_add("search_match", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
 
     def _build_inputs_tab(self, parent: tk.Widget) -> None:
         p = parent
@@ -929,6 +1117,7 @@ class App(tk.Tk):
             cfg = _parse_yaml_text(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             return
+        self._log(f"Loaded app config {path}")
         # Defer until layout is fully realized so sashpos() takes effect
         self.after(200, lambda: self._apply_config(cfg))
 
@@ -937,6 +1126,8 @@ class App(tk.Tk):
             path.write_text(_dump_yaml(self._get_config()), encoding="utf-8")
         except OSError:
             pass
+        else:
+            self._log(f"Saved app config {path}")
 
     def _set_brain_yaml_text(self, text: str) -> None:
         self._brain_yaml_editor.delete("1.0", tk.END)
@@ -954,6 +1145,7 @@ class App(tk.Tk):
         self._set_brain_yaml_text(_dump_yaml(DEFAULT_BRAIN_CONFIG))
         self._yaml_path_label.config(text="Unsaved YAML", foreground="gray")
         self._status_label.config(text="Default YAML loaded", foreground="gray")
+        self._log("Loaded default brain YAML")
         self._validate_model_compatibility()
 
     def _validate_brain_yaml_text(self, text: str) -> dict:
@@ -965,6 +1157,7 @@ class App(tk.Tk):
         return brain_cfg
 
     def _validate_brain_config(self, cfg: dict) -> None:
+        _runtime_safe_id(_brain_id_from_config(cfg))
         self._require_mapping_section(cfg, "brain")
         self._require_section(cfg, "assembly")
         self._require_section(cfg, "inputs")
@@ -977,6 +1170,9 @@ class App(tk.Tk):
         self._yaml_float(brain_cfg, "weight_min", default=0.0)
         self._yaml_float(brain_cfg, "weight_max", default=1.0)
         self._yaml_float(brain_cfg, "total_input", default=1000.0)
+        self._yaml_int(brain_cfg, "NUMBER_OF_LAYERS", aliases=("number_of_layers",), default=1, minimum=1)
+        self._yaml_int(brain_cfg, "HISTORY_DEPTH", aliases=("history_depth",), default=32, minimum=1)
+        self._yaml_float(brain_cfg, "CHARGE_MAX", aliases=("charge_max",), default=100.0, minimum=0.0)
         positions = self._assembly_positions(cfg, target_n)
         self._validate_input_specs(cfg, len(positions))
         self._initialize_outputs(cfg, len(positions))
@@ -1100,6 +1296,7 @@ class App(tk.Tk):
             _, visualization = _split_visualization_sections(_parse_yaml_text(text))
         except (OSError, ValueError) as exc:
             messagebox.showerror("Load YAML", f"Could not load YAML:\n{exc}")
+            self._log(f"Brain YAML load failed ({path}): {exc}")
             return
         self._brain_yaml_path = path
         self._set_brain_yaml_text(
@@ -1111,6 +1308,7 @@ class App(tk.Tk):
         if apply_visualization and visualization:
             self._apply_visualization_config(visualization)
         self._save_config(CONFIG_PATH)
+        self._log(f"Loaded brain YAML {path}")
         self._validate_model_compatibility()
 
     def _save_brain_yaml(self) -> None:
@@ -1143,10 +1341,12 @@ class App(tk.Tk):
             self._set_brain_yaml_text(text_to_write)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Save YAML", f"Could not save YAML:\n{exc}")
+            self._log(f"Brain YAML save failed ({path}): {exc}")
             return
         self._brain_yaml_path = path
         self._yaml_path_label.config(text=str(path), foreground="gray")
         self._save_config(CONFIG_PATH)
+        self._log(f"Saved brain YAML {path}")
         self._validate_model_compatibility()
 
     def _set_world_yaml_text(self, text: str) -> None:
@@ -1165,6 +1365,7 @@ class App(tk.Tk):
         self._set_world_yaml_text(module.GetDefaultConfig())
         self._world_yaml_path_label.config(text="Unsaved YAML", foreground="gray")
         self._world_status_label.config(text=f"Default YAML loaded ({module.__name__})", foreground="gray")
+        self._log(f"Loaded default world YAML ({module.__name__})")
         self._validate_model_compatibility()
         self._draw_world()
 
@@ -1183,12 +1384,14 @@ class App(tk.Tk):
             module = self._world_module_for_config(data)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Load world YAML", f"Could not load YAML:\n{exc}")
+            self._log(f"World YAML load failed ({path}): {exc}")
             return
         self._select_world_module(module)
         self._world_yaml_path = path
         self._set_world_yaml_text(text)
         self._world_yaml_path_label.config(text=str(path), foreground="gray")
         self._save_config(CONFIG_PATH)
+        self._log(f"Loaded world YAML {path}")
         self._validate_model_compatibility()
 
     def _save_world_yaml(self) -> None:
@@ -1213,10 +1416,12 @@ class App(tk.Tk):
             path.write_text(text, encoding="utf-8")
         except (OSError, ValueError) as exc:
             messagebox.showerror("Save world YAML", f"Could not save YAML:\n{exc}")
+            self._log(f"World YAML save failed ({path}): {exc}")
             return
         self._world_yaml_path = path
         self._world_yaml_path_label.config(text=str(path), foreground="gray")
         self._save_config(CONFIG_PATH)
+        self._log(f"Saved world YAML {path}")
         self._validate_model_compatibility()
 
     def _apply_visualization_config(self, visualization: dict) -> None:
@@ -1506,7 +1711,8 @@ class App(tk.Tk):
         if idx is None:
             return
         neu = self._brain.substrate.brain[idx]
-        neu.active = not neu.active
+        self._set_neuron_runtime_active(idx, not neu.active)
+        self._save_runtime_state()
         self._draw_brain()
         self._refresh_output_values()
         # If the toggled neuron is the currently selected one, refresh panel and status bar
@@ -1626,8 +1832,9 @@ class App(tk.Tk):
         if src_idx < 0 or src_idx >= len(self._brain.substrate.brain):
             return
         neuron = self._brain.substrate.brain[src_idx]
-        neuron.active = not neuron.active
+        self._set_neuron_runtime_active(src_idx, not neuron.active)
         self._highlight_neuron_idx = src_idx
+        self._save_runtime_state()
         selected_idx = self._cas_neuron_idx
         if selected_idx is not None:
             self._update_neuron_panel(selected_idx)
@@ -1670,6 +1877,7 @@ class App(tk.Tk):
         if self._brain:
             for neuron in self._brain.substrate.brain:
                 neuron.active = False
+            self._save_runtime_state()
         self._update_seq_label()
         self._draw_brain()
 
@@ -1682,6 +1890,7 @@ class App(tk.Tk):
         for i, neuron in enumerate(self._brain.substrate.brain):
             neuron.active = i in in_window
         self._seq_cursor += 1
+        self._save_runtime_state()
         self._update_seq_label()
         self._draw_brain()
 
@@ -1715,17 +1924,20 @@ class App(tk.Tk):
             messagebox.showerror("World init", f"Invalid world YAML:\n{exc}")
             self._world_initialized = False
             self._world_status_label.config(text="Invalid YAML", foreground="red")
+            self._log(f"World initialization failed: {exc}")
             self._draw_world()
             return
         self._world_initialized = True
         self._select_world_module(module)
         self._world_status_label.config(text="Initialized", foreground="green")
+        self._log(f"World initialized ({module.__name__})")
         self._validate_model_compatibility()
         self._draw_world()
 
     def _on_initialize(self) -> None:
         try:
             cfg = self._read_brain_yaml()
+            brain_id = _brain_id_from_config(cfg)
             brain_cfg = cfg.get("brain", cfg)
             if not isinstance(brain_cfg, dict):
                 raise ValueError("brain must be a mapping.")
@@ -1741,11 +1953,21 @@ class App(tk.Tk):
             w_min = self._yaml_float(brain_cfg, "weight_min", default=0.0)
             w_max = self._yaml_float(brain_cfg, "weight_max", default=1.0)
             total_in = self._yaml_float(brain_cfg, "total_input", default=1000.0)
+            number_of_layers = self._yaml_int(
+                brain_cfg, "NUMBER_OF_LAYERS", aliases=("number_of_layers",), default=1, minimum=1
+            )
+            history_depth = self._yaml_int(
+                brain_cfg, "HISTORY_DEPTH", aliases=("history_depth",), default=32, minimum=1
+            )
+            charge_max = self._yaml_float(
+                brain_cfg, "CHARGE_MAX", aliases=("charge_max",), default=100.0, minimum=0.0
+            )
             seed_value = brain_cfg.get("seed")
             seed = None if seed_value in (None, "") else int(seed_value)
         except (TypeError, ValueError) as exc:
             messagebox.showerror("Init", f"Invalid brain YAML:\n{exc}")
             self._status_label.config(text="Invalid YAML", foreground="red")
+            self._log(f"Brain initialization failed: {exc}")
             return
 
         try:
@@ -1761,6 +1983,9 @@ class App(tk.Tk):
                 total_input=total_in,
                 head_count=head,
                 seed=seed,
+                number_of_layers=number_of_layers,
+                history_depth=history_depth,
+                charge_max=charge_max,
             )
             input_rng = random.Random(seed) if seed is not None else random.Random()
             input_indices, input_specs = self._initialize_inputs(brain, positions, cfg, n, input_rng)
@@ -1768,6 +1993,7 @@ class App(tk.Tk):
         except (TypeError, ValueError) as exc:
             messagebox.showerror("Init", f"Invalid brain YAML:\n{exc}")
             self._status_label.config(text="Invalid YAML", foreground="red")
+            self._log(f"Brain initialization failed: {exc}")
             return
 
         if input_indices:
@@ -1785,6 +2011,7 @@ class App(tk.Tk):
             adj_out.setdefault(src_idx, []).append((dst_idx, w))
         self._positions = positions
         self._brain = brain
+        self._brain_id = brain_id
         self._in_counts = in_counts
         self._out_counts = out_counts
         self._input_indices = input_indices
@@ -1805,12 +2032,18 @@ class App(tk.Tk):
         self._cas_signal.clear()
         self._cas_neuron_idx = None
         self._highlight_neuron_idx = None
+        self._runtime_active_overrides.clear()
         self._neuron_info_label.config(text="")
         self._iteration = 0
         self._status_label.config(
             text=f"Initialized  ({n} neurons,  {self._head_size} head,  {len(input_indices)} inputs)",
             foreground="green",
         )
+        self._log(
+            f"Brain initialized ({brain_id}: {n} neurons, {self._head_size} head, "
+            f"{len(input_indices)} inputs, {len(brain.substrate.connectome)} connections)"
+        )
+        self._save_runtime_state()
         self._update_iteration_display()
         self._refresh_inputs_editor()
         self._draw_cas()
@@ -1851,6 +2084,8 @@ class App(tk.Tk):
             for offset, idx in enumerate(chosen):
                 neurons[idx].eq = self._spread_value(eq_min, eq_max, offset, len(chosen))
                 neurons[idx].charge = value
+                neurons[idx].signal[0] = value
+                neurons[idx].active = value > neurons[idx].trigger[0] + neurons[idx].trigger_flex + neurons[idx].eq
                 input_indices.add(idx)
             input_specs.append({"name": name, "indices": chosen, "value": value})
         return input_indices, input_specs
@@ -2195,8 +2430,10 @@ class App(tk.Tk):
         for idx in spec["indices"]:
             if idx < len(neurons):
                 neurons[idx].charge = value
-                neurons[idx].active = neurons[idx].charge >= neurons[idx].eq + neurons[idx].elastic_trigger_delta
+                neurons[idx].signal[0] = value
+                neurons[idx].active = value > neurons[idx].trigger[0] + neurons[idx].trigger_flex + neurons[idx].eq
         if redraw:
+            self._save_runtime_state()
             self._draw_brain()
             self._refresh_output_values()
 
@@ -2282,36 +2519,45 @@ class App(tk.Tk):
         if self._running:
             return
         self._running = True
+        self._log("Simulation started")
         self._tick()
 
     def _on_stop(self) -> None:
+        was_running = self._running or self._tick_id is not None
         self._running = False
         if self._tick_id is not None:
             self.after_cancel(self._tick_id)
             self._tick_id = None
+        if was_running:
+            self._log("Simulation paused")
 
     def _on_step(self) -> None:
         if self._brain:
-            # brain.process() goes here
             self._apply_all_input_values()
+            self._process_brain_with_selected_neuron_log()
             self._iteration += 1
+            self._save_runtime_state()
             self._record_history()
             self._refresh_charts()
             self._refresh_output_values()
             self._update_iteration_display()
+            self._log(f"Simulation stepped to iteration {self._iteration}")
 
     def _on_reset(self) -> None:
         self._on_stop()
         self._iteration = 0
         self._update_iteration_display()
+        self._save_runtime_state()
+        self._log("Simulation reset")
 
     def _tick(self) -> None:
         if not self._running:
             return
         if self._brain:
-            # brain.process() goes here
             self._apply_all_input_values()
+            self._process_brain_with_selected_neuron_log()
             self._iteration += 1
+            self._save_runtime_state()
             self._record_history()
             self._refresh_charts()
             self._refresh_output_values()
@@ -2338,12 +2584,206 @@ class App(tk.Tk):
             return None
         return self._brain.substrate.brain[self._cas_neuron_idx]
 
+    def _set_neuron_runtime_active(self, idx: int, active: bool) -> None:
+        if self._brain is None or idx < 0 or idx >= len(self._brain.substrate.brain):
+            return
+        self._runtime_active_overrides[idx] = bool(active)
+        self._apply_neuron_active_override(idx, bool(active))
+
+    def _apply_runtime_active_overrides(self) -> None:
+        if self._brain is None:
+            return
+        for idx, active in list(self._runtime_active_overrides.items()):
+            if idx >= len(self._brain.substrate.brain):
+                del self._runtime_active_overrides[idx]
+                continue
+            self._apply_neuron_active_override(idx, active)
+
+    def _apply_neuron_active_override(self, idx: int, active: bool) -> None:
+        neuron = self._brain.substrate.brain[idx]
+        neuron.resize_layers(self._brain.number_of_layers)
+        if active:
+            neuron.status[0] = True
+            threshold = neuron.trigger[0] + neuron.trigger_flex + neuron.eq
+            forced_signal = max(neuron.signal[0], neuron.charge, threshold + 1e-9, 1.0)
+            neuron.signal[0] = forced_signal
+            neuron.charge = min(neuron.charge_max, max(neuron.charge, forced_signal))
+        else:
+            neuron.status = [False] * neuron.number_of_layers
+            neuron.signal[0] = 0.0
+
+    def _process_brain_with_selected_neuron_log(self) -> None:
+        if self._brain is None:
+            return
+        self._apply_runtime_active_overrides()
+        selected_idx = self._cas_neuron_idx
+        if selected_idx is None or selected_idx >= len(self._brain.substrate.brain):
+            self._brain.process()
+            self._apply_runtime_active_overrides()
+            return
+
+        trace = self._selected_neuron_process_trace(selected_idx)
+        self._brain.process()
+        self._apply_runtime_active_overrides()
+        self._log_selected_neuron_process_trace(selected_idx, trace)
+
+    def _selected_neuron_process_trace(self, idx: int) -> dict:
+        neurons = self._brain.substrate.brain
+        neuron = neurons[idx]
+        threshold = neuron.trigger[0] + neuron.trigger_flex + neuron.eq
+        incoming_links = []
+        total_signal = 0.0
+        raw_total_signal = 0.0
+
+        for src_idx, weight in self._adj_in.get(idx, []):
+            src = neurons[src_idx]
+            src_threshold = src.trigger[0] + src.trigger_flex + src.eq
+            src_ready = src.active
+            raw_signal = src.signal[0] * weight
+            signal = raw_signal if src_ready else 0.0
+            raw_total_signal += raw_signal
+            total_signal += signal
+            incoming_links.append({
+                "src": src_idx,
+                "src_active": src.active,
+                "src_status": list(src.status),
+                "src_signal": list(src.signal),
+                "src_charge": src.charge,
+                "src_eq": src.eq,
+                "src_trigger": list(src.trigger),
+                "src_trigger_flex": src.trigger_flex,
+                "src_threshold": src_threshold,
+                "src_ready": src_ready,
+                "weight": weight,
+                "raw_signal": raw_signal,
+                "signal": signal,
+            })
+
+        charge_after_signal = neuron.charge + total_signal
+        active_after_signal = total_signal > threshold
+        discharge = max(0.0, neuron.cyclic_discharge) if active_after_signal else 0.0
+        recharge = 0.0 if active_after_signal else max(0.0, neuron.elastic_recharge)
+        final_charge_estimate = (
+            max(0.0, charge_after_signal - discharge)
+            if active_after_signal
+            else charge_after_signal + recharge
+        )
+        final_tiredness_estimate = (
+            neuron.tiredness + discharge
+            if active_after_signal
+            else max(0.0, neuron.tiredness - recharge)
+        )
+
+        return {
+            "iteration": self._brain.iteration_idx,
+            "pre_active": neuron.active,
+            "pre_status": list(neuron.status),
+            "pre_signal": list(neuron.signal),
+            "pre_charge": neuron.charge,
+            "pre_cumulative_signal": neuron.cumulative_signal,
+            "pre_tiredness": neuron.tiredness,
+            "eq": neuron.eq,
+            "trigger": list(neuron.trigger),
+            "trigger_flex": neuron.trigger_flex,
+            "threshold": threshold,
+            "recharge": neuron.recharge,
+            "recharge_flex": neuron.recharge_flex,
+            "cyclic_discharge": neuron.cyclic_discharge,
+            "history_len": len(neuron.history_table),
+            "incoming_links": incoming_links,
+            "total_signal": total_signal,
+            "raw_total_signal": raw_total_signal,
+            "charge_after_signal": charge_after_signal,
+            "active_after_signal": active_after_signal,
+            "discharge": discharge,
+            "recharge": recharge,
+            "final_charge_estimate": final_charge_estimate,
+            "final_tiredness_estimate": final_tiredness_estimate,
+        }
+
+    def _log_selected_neuron_process_trace(self, idx: int, trace: dict) -> None:
+        neuron = self._brain.substrate.brain[idx]
+        lines = [
+            (
+                f"Selected neuron #{idx} process trace "
+                f"(brain iteration {trace['iteration']} -> {self._brain.iteration_idx})"
+            ),
+            (
+                "  before: "
+                f"active={trace['pre_active']} "
+                f"status={trace['pre_status']} "
+                f"signal={trace['pre_signal']} "
+                f"charge={trace['pre_charge']:.6f} "
+                f"cumulative_signal={trace['pre_cumulative_signal']:.6f} "
+                f"tiredness={trace['pre_tiredness']:.6f} "
+                f"history_len={trace['history_len']}"
+            ),
+            (
+                "  threshold: "
+                f"eq={trace['eq']:.6f} "
+                f"trigger={trace['trigger']} "
+                f"trigger_flex={trace['trigger_flex']:.6f} "
+                f"threshold={trace['threshold']:.6f}"
+            ),
+            (
+                "  incoming: "
+                f"active_source_signal={trace['total_signal']:.6f} "
+                f"raw_all_source_signal={trace['raw_total_signal']:.6f} "
+                f"input_links={len(trace['incoming_links'])}"
+            ),
+        ]
+        for link in trace["incoming_links"]:
+            lines.append(
+                "    link "
+                f"src={link['src']} "
+                f"src_active={link['src_active']} "
+                f"src_status={link['src_status']} "
+                f"src_signal={link['src_signal']} "
+                f"src_charge={link['src_charge']:.6f} "
+                f"src_eq={link['src_eq']:.6f} "
+                f"src_trigger={link['src_trigger']} "
+                f"src_trigger_flex={link['src_trigger_flex']:.6f} "
+                f"src_threshold={link['src_threshold']:.6f} "
+                f"src_ready={link['src_ready']} "
+                f"weight={link['weight']:.6f} "
+                f"raw_signal={link['raw_signal']:.6f} "
+                f"applied_signal={link['signal']:.6f}"
+            )
+        lines.extend([
+            (
+                "  decision: "
+                f"charge_after_signal={trace['charge_after_signal']:.6f} "
+                f"active_after_signal={trace['active_after_signal']} "
+                f"cyclic_discharge_applied={trace['discharge']:.6f} "
+                f"elastic_recharge_applied={trace['recharge']:.6f}"
+            ),
+            (
+                "  expected after: "
+                f"charge={trace['final_charge_estimate']:.6f} "
+                f"tiredness={trace['final_tiredness_estimate']:.6f}"
+            ),
+            (
+                "  actual after: "
+                f"active={neuron.active} "
+                f"status={neuron.status} "
+                f"signal={neuron.signal} "
+                f"charge={neuron.charge:.6f} "
+                f"cumulative_signal={neuron.cumulative_signal:.6f} "
+                f"tiredness={neuron.tiredness:.6f} "
+                f"history_len={len(neuron.history_table)}"
+            ),
+        ])
+        self._log("\n".join(lines))
+
     def _apply_selected_neuron_active(self) -> None:
         neuron = self._selected_neuron()
         if neuron is None:
             return
         vals = self._neuron_fields_panel["vals"]
-        neuron.active = bool(vals["active_var"].get())
+        idx = self._cas_neuron_idx
+        if idx is None:
+            return
+        self._set_neuron_runtime_active(idx, bool(vals["active_var"].get()))
         self._refresh_selected_neuron_after_edit()
 
     def _apply_selected_neuron_field(self, event: tk.Event) -> None:
@@ -2375,6 +2815,7 @@ class App(tk.Tk):
         idx = self._cas_neuron_idx
         if idx is None:
             return
+        self._save_runtime_state()
         self._draw_brain()
         self._draw_cas()
         self._update_neuron_panel(idx)
@@ -2394,9 +2835,9 @@ class App(tk.Tk):
         link_rows = []
         for src, w in self._adj_in.get(idx, []):
             sn = neurons[src]
-            threshold = sn.eq + sn.elastic_trigger_delta
-            status = "ready" if sn.charge >= threshold else "idle"
-            sig = sn.charge * w
+            threshold = sn.trigger[0] + sn.trigger_flex + sn.eq
+            status = "ready" if sn.active else "idle"
+            sig = sn.signal[0] * float(sn.active) * w
             total_signal += sig
             link_rows.append((
                 src,
@@ -2540,6 +2981,7 @@ class App(tk.Tk):
                    0, 0, W, H, y_min=0, y_max=max(n_total, 1))
 
     def _on_close(self) -> None:
+        self._log("Application closing")
         self._on_stop()
         self._save_config(CONFIG_PATH)
         self.destroy()

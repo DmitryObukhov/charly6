@@ -1,77 +1,17 @@
-"""Brain simulation engine (Neuron, Substrate, Brain, factory functions)."""
+"""Brain factory functions and compatibility exports."""
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
-from typing import Sequence, TypeAlias
 
-HistoryEntry: TypeAlias = tuple[int, float, bool]
-Connection: TypeAlias = tuple[int, int, float]
-
-
-@dataclass(slots=True)
-class Neuron:
-    active: bool = False
-    eq: float = 0.0
-    cumulative_signal: float = 0.0
-    elastic_trigger_delta: float = 0.0
-    charge: float = 0.0
-    elastic_recharge: float = 0.0
-    cyclic_discharge: float = 0.0
-    tiredness: float = 0.0
-    history_table: list[HistoryEntry] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class Substrate:
-    brain: list[Neuron] = field(default_factory=list)
-    connectome: list[Connection] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class Brain:
-    substrate: Substrate = field(default_factory=Substrate)
-    iteration_idx: int = 0
-
-    def get_inputs(self, inputs: Sequence[float]) -> None:
-        neurons = self.substrate.brain
-        if len(inputs) > len(neurons):
-            raise ValueError("inputs length cannot exceed neuron count")
-        for idx, signal in enumerate(inputs):
-            value = float(signal)
-            neurons[idx].charge += value
-            neurons[idx].cumulative_signal += value
-
-    def process(self) -> None:
-        neurons = self.substrate.brain
-        propagated = [0.0] * len(neurons)
-        for src_idx, dst_idx, weight in self.substrate.connectome:
-            src = neurons[src_idx]
-            if src.charge >= src.eq + src.elastic_trigger_delta:
-                propagated[dst_idx] += src.charge * weight
-        for idx, neuron in enumerate(neurons):
-            incoming = propagated[idx]
-            if incoming:
-                neuron.charge += incoming
-                neuron.cumulative_signal += incoming
-            threshold = neuron.eq + neuron.elastic_trigger_delta
-            neuron.active = neuron.charge >= threshold
-            if neuron.active:
-                discharge = max(0.0, neuron.cyclic_discharge)
-                neuron.charge = max(0.0, neuron.charge - discharge)
-                neuron.tiredness += discharge
-            else:
-                recharge = max(0.0, neuron.elastic_recharge)
-                neuron.charge += recharge
-                neuron.tiredness = max(0.0, neuron.tiredness - recharge)
-            neuron.history_table.append((self.iteration_idx, neuron.cumulative_signal, neuron.active))
-        self.iteration_idx += 1
-
-    def set_outputs(self, output_indices: Sequence[int] | None = None) -> list[bool]:
-        neurons = self.substrate.brain
-        indices = range(len(neurons)) if output_indices is None else output_indices
-        return [neurons[idx].active for idx in indices]
+from charly6.brain_model import Brain, Connection, Substrate
+from charly6.neuron import (
+    DEFAULT_CHARGE_MAX,
+    DEFAULT_HISTORY_DEPTH,
+    DEFAULT_NUMBER_OF_LAYERS,
+    HistoryEntry,
+    Neuron,
+)
 
 
 def create_random_brain(
@@ -81,10 +21,21 @@ def create_random_brain(
     weight_min: float = 0.0,
     weight_max: float = 1.0,
     seed: int | None = None,
+    number_of_layers: int = DEFAULT_NUMBER_OF_LAYERS,
+    history_depth: int = DEFAULT_HISTORY_DEPTH,
+    charge_max: float = DEFAULT_CHARGE_MAX,
 ) -> Brain:
     if neuron_count <= 0:
         raise ValueError("neuron_count must be > 0")
-    neurons = [Neuron() for _ in range(neuron_count)]
+    neurons = [
+        Neuron(
+            name=str(idx),
+            number_of_layers=number_of_layers,
+            history_depth=history_depth,
+            charge_max=charge_max,
+        )
+        for idx in range(neuron_count)
+    ]
     rng = random.Random(seed)
     connectome: list[Connection] = []
     for src_idx in range(neuron_count):
@@ -92,7 +43,12 @@ def create_random_brain(
         sample_size = min(connections_per_neuron, len(destinations))
         for dst_idx in rng.sample(destinations, k=sample_size):
             connectome.append((src_idx, dst_idx, rng.uniform(weight_min, weight_max)))
-    return Brain(substrate=Substrate(brain=neurons, connectome=connectome))
+    return Brain(
+        substrate=Substrate(brain=neurons, connectome=connectome),
+        number_of_layers=number_of_layers,
+        history_depth=history_depth,
+        charge_max=charge_max,
+    )
 
 
 def create_spatial_brain(
@@ -105,6 +61,9 @@ def create_spatial_brain(
     total_input: float = 1000.0,
     head_count: int = 0,
     seed: int | None = None,
+    number_of_layers: int = DEFAULT_NUMBER_OF_LAYERS,
+    history_depth: int = DEFAULT_HISTORY_DEPTH,
+    charge_max: float = DEFAULT_CHARGE_MAX,
 ) -> Brain:
     """Create a brain whose connectome is built from spatial proximity.
 
@@ -136,10 +95,20 @@ def create_spatial_brain(
     for idx, (px, py) in enumerate(positions):
         grid.setdefault((int(px / cell), int(py / cell)), []).append(idx)
 
-    neurons = [Neuron() for _ in range(n)]
+    neurons = [
+        Neuron(
+            name=str(idx),
+            number_of_layers=number_of_layers,
+            history_depth=history_depth,
+            charge_max=charge_max,
+        )
+        for idx in range(n)
+    ]
     for i, neuron in enumerate(neurons):
         neuron.eq = total_input
-        neuron.charge = total_input if i < head_count else total_input * 0.9
+        neuron.trigger[0] = total_input
+        neuron.charge = min(charge_max, total_input if i < head_count else total_input * 0.9)
+        neuron.signal[0] = neuron.charge if i < head_count else 0.0
 
     connectome: list[Connection] = []
 
@@ -176,4 +145,9 @@ def create_spatial_brain(
         for src_idx, w in zip(chosen, raw):
             connectome.append((src_idx, dst_idx, w))
 
-    return Brain(substrate=Substrate(brain=neurons, connectome=connectome))
+    return Brain(
+        substrate=Substrate(brain=neurons, connectome=connectome),
+        number_of_layers=number_of_layers,
+        history_depth=history_depth,
+        charge_max=charge_max,
+    )

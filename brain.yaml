@@ -1,4 +1,5 @@
 # --------------------------------------------------- Brain configuration
+ID: charly_6_1
 brain:
   neurons: 2000
   head_size: 0
@@ -8,6 +9,9 @@ brain:
   weight_max: 1.0
   total_input: 1000.0
   seed: 42
+  NUMBER_OF_LAYERS: 1
+  HISTORY_DEPTH: 32
+  CHARGE_MAX: 100.0
 
 # --------------------------------------------------- Topology
 assembly:
