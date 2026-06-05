@@ -22,6 +22,7 @@ def test_neuron_serializes_to_json_compatible_data() -> None:
         elastic_recharge=0.75,
         cyclic_discharge=1.25,
         tiredness=4.5,
+        drop_charge_next_cycle=True,
         history_table=[(1, 2.0, True), (2, 3.0, False)],
     )
 
@@ -41,6 +42,7 @@ def test_neuron_deserializes_from_serialized_data() -> None:
         elastic_recharge=0.75,
         cyclic_discharge=1.25,
         tiredness=4.5,
+        drop_charge_next_cycle=True,
         history_table=[(1, 2.0, True), (2, 3.0, False)],
     )
 

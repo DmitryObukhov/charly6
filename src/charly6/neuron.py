@@ -77,6 +77,7 @@ class Neuron:
         "cumulative_signal",
         "tiredness",
         "cyclic_discharge",
+        "drop_charge_next_cycle",
     )
 
     def __init__(
@@ -103,6 +104,7 @@ class Neuron:
         elastic_recharge: float | None = None,
         cyclic_discharge: float = 0.0,
         tiredness: float = 0.0,
+        drop_charge_next_cycle: bool = False,
         history_table: list[LegacyHistoryEntry] | None = None,
     ) -> None:
         self.number_of_layers = _as_positive_int(number_of_layers, DEFAULT_NUMBER_OF_LAYERS)
@@ -119,7 +121,7 @@ class Neuron:
             trigger_flex if elastic_trigger_delta is None else elastic_trigger_delta
         )
         self.charge_min = self._clamp_charge(charge_min)
-        self.charge = max(self.charge_min, self._clamp_charge(charge))
+        self.charge = self._clamp_charge(charge)
         self.recharge = min(self.charge_max, max(0.0, _as_float(recharge)))
         self.recharge_flex = min(
             self.charge_max,
@@ -142,6 +144,7 @@ class Neuron:
         self.cumulative_signal = _as_float(cumulative_signal)
         self.tiredness = _as_float(tiredness)
         self.cyclic_discharge = max(0.0, _as_float(cyclic_discharge))
+        self.drop_charge_next_cycle = bool(drop_charge_next_cycle)
 
     @property
     def active(self) -> bool:
@@ -233,6 +236,7 @@ class Neuron:
             "cumulative_signal": self.cumulative_signal,
             "tiredness": self.tiredness,
             "cyclic_discharge": self.cyclic_discharge,
+            "drop_charge_next_cycle": self.drop_charge_next_cycle,
         }
 
     @classmethod
@@ -258,6 +262,7 @@ class Neuron:
             cumulative_signal=float(data.get("cumulative_signal", 0.0)),
             cyclic_discharge=float(data.get("cyclic_discharge", 0.0)),
             tiredness=float(data.get("tiredness", 0.0)),
+            drop_charge_next_cycle=bool(data.get("drop_charge_next_cycle", False)),
             history_table=data.get("history_table"),
         )
 

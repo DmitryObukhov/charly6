@@ -74,8 +74,11 @@ class Brain:
         for idx, signal in enumerate(inputs):
             value = float(signal)
             neurons[idx].signal[0] += value
-            neurons[idx].charge = min(neurons[idx].charge_max, max(neurons[idx].charge_min, value))
-            neurons[idx].active = value > neurons[idx].trigger[0] + neurons[idx].trigger_flex + neurons[idx].eq
+            neurons[idx].charge = min(neurons[idx].charge_max, max(0.0, value))
+            neurons[idx].active = (
+                neurons[idx].charge >= neurons[idx].charge_min
+                and value > neurons[idx].trigger[0] + neurons[idx].trigger_flex + neurons[idx].eq
+            )
             neurons[idx].cumulative_signal += value
 
     def process(self) -> None:
@@ -86,13 +89,17 @@ class Brain:
             neuron.history_depth = self.history_depth
             neuron.charge_max = self.charge_max
             neuron.resize_layers(layers)
+            if neuron.drop_charge_next_cycle:
+                neuron.status = [False] * layers
 
-        previous_status = [list(neuron.status) for neuron in neurons]
-        previous_signal = [list(neuron.signal) for neuron in neurons]
-        propagated = [[0.0] * layers for _ in neurons]
+        old_neurons = [Neuron.from_dict(neuron.to_dict()) for neuron in neurons]
+        new_neurons = [Neuron.from_dict(neuron.to_dict()) for neuron in old_neurons]
+        previous_status = [list(neuron.status) for neuron in old_neurons]
+        previous_signal = [list(neuron.signal) for neuron in old_neurons]
+        propagated = [[0.0] * layers for _ in old_neurons]
 
         for src_idx, dst_idx, weight in self.substrate.connectome:
-            if src_idx >= len(neurons) or dst_idx >= len(neurons):
+            if src_idx >= len(old_neurons) or dst_idx >= len(old_neurons):
                 continue
             weights = self._connection_weights(weight, layers)
             for layer_idx in range(layers):
@@ -102,13 +109,16 @@ class Brain:
                     * weights[layer_idx]
                 )
 
-        for idx, neuron in enumerate(neurons):
+        for idx, neuron in enumerate(new_neurons):
             neuron.signal = propagated[idx]
             neuron.cumulative_signal += sum(propagated[idx])
+            recharge = max(0.0, neuron.recharge + neuron.recharge_flex)
+            recharging = neuron.drop_charge_next_cycle
+            can_activate = not recharging and neuron.charge >= neuron.charge_min
             statuses = []
             for layer_idx in range(layers):
                 threshold = neuron.trigger[layer_idx] + neuron.trigger_flex + neuron.eq
-                statuses.append(neuron.signal[layer_idx] > threshold)
+                statuses.append(can_activate and neuron.signal[layer_idx] > threshold)
             if any(statuses):
                 statuses[0] = True
             neuron.status = statuses
@@ -117,14 +127,18 @@ class Brain:
                 if random.random() < neuron.discharge_random:
                     neuron.charge = neuron.charge_min
             if neuron.active:
-                discharge = max(0.0, neuron.cyclic_discharge)
-                neuron.charge = max(neuron.charge_min, neuron.charge - discharge)
-                neuron.tiredness += discharge
+                neuron.charge = 0.0
+                neuron.drop_charge_next_cycle = True
+                neuron.tiredness += max(0.0, neuron.cyclic_discharge)
             else:
-                recharge = max(0.0, neuron.recharge + neuron.recharge_flex)
-                neuron.charge = min(neuron.charge_max, neuron.charge + recharge)
                 neuron.tiredness = max(0.0, neuron.tiredness - recharge)
+                neuron.charge = min(neuron.charge_max, neuron.charge + recharge)
+                if neuron.drop_charge_next_cycle and neuron.charge >= neuron.charge_max:
+                    neuron.drop_charge_next_cycle = False
             neuron.record_history(self.iteration_idx)
+        for old_neuron, new_neuron in zip(neurons, new_neurons):
+            for attr in Neuron.__slots__:
+                setattr(old_neuron, attr, getattr(new_neuron, attr))
         self.iteration_idx += 1
 
     def _connection_weights(self, weight: Any, layers: int) -> list[float]:

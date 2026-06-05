@@ -138,9 +138,25 @@ def GetDefaultConfig() -> str:
     return _DEFAULT_CONFIG
 
 
-def Process(inputs: dict[str, float]) -> dict[str, float]:
+def Validate(config_yaml: str) -> tuple[bool, list[str]]:
+    """Return whether the YAML is valid and a list of detected problems."""
+    try:
+        _parse_config(config_yaml)
+    except Exception as exc:
+        return False, [str(exc)]
+    return True, []
+
+
+def validate(config_yaml: str) -> tuple[bool, list[str]]:
+    """Lowercase alias for callers that prefer validate()."""
+    return Validate(config_yaml)
+
+
+def Process(inputs: dict[str, float] | None) -> dict[str, float]:
     """Advance the world by one step and return observable values."""
     cfg, state = _require_initialized()
+    if inputs is None:
+        return _collect_outputs(cfg, state)
     normalized = _validate_inputs(inputs, cfg)
     if cfg.max_steps is not None and state.step >= cfg.max_steps:
         return _collect_outputs(cfg, state)

@@ -34,17 +34,21 @@ You can also launch through the root helper:
 
 The app remembers local UI state in `charly6.config.yaml`, including the last loaded brain YAML and visualization settings. The sample brain definition is `brain.yaml`.
 
-Brain YAML supports these top-level sections:
+The app uses one combined YAML file based on the brain config. Brain sections stay
+at the top level, and the physical world config lives under `physical_world`.
 
-- `brain`: neuron count, head size, connection count, synapse length, weight range, total input, and seed.
-- `assembly`: layout steps. Current methods are `phc`, `spiral`, and `straight`/`stright`. A `count` of `LAST` fills the remaining `brain.neurons`.
+Combined YAML supports these top-level sections:
+
+- `brain`: neuron count, head size, connection count, synapse length, weight range, total input, seed, constants, and `Initialization` defaults.
+- `assembly`: topology folding steps. Current folding modules are `phc` and `spiral`; legacy `straight`/`stright` is still accepted. A `count` of `LAST` fills the remaining `brain.neurons`.
 - `inputs`: named physical inputs. Each input selects neurons around a `center` within a `radius`, assigns `number` selected neurons, and spreads `eq` from `eq_min` to `eq_max`.
 - `outputs`: named output groups, each mapped to neuron indices.
 - `transfer_function`: currently parsed as YAML content but not used by the GUI runtime.
+- `physical_world`: nested world plugin YAML with its own `world`, `objects`, `inputs`, and `outputs`.
 
 ## Physical Worlds
 
-Physical world implementations live in `worlds/` and expose the stable API described by `prompts/physical_world.md`: `Init`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
+Physical world implementations live in `worlds/` and expose the stable API described by `prompts/physical_world.md`: `Init`, `Validate`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
 
 The first implementation is `worlds.linear`, a deterministic 2D visualization with a single agent coordinate on the X axis, a `light` object (`x`, `brightness`), and agent `stomach_content` in the range `0..10`. Its YAML keeps runtime settings such as `base`, `dt`, `seed`, `input_validation`, and `max_steps` inside the top-level `world` section. It accepts normalized `left_motor` and `right_motor` inputs, advances one physics step per `Process` call, and returns float observations such as `velocity`, `hunger`, and `light`.
 
@@ -62,8 +66,19 @@ brain:
   weight_max: 1.0
   total_input: 1000.0
   seed: 42
+  NUMBER_OF_LAYERS: 1
+  HISTORY_DEPTH: 32
+  CHARGE_MAX: 100.0
+  Initialization:
+    default_charge: charge_max
+    default_recharge: 0.2
+    default_eq_min: -0.1
+    default_eq_max: 0.1
 
 assembly:
+  # Available foldings:
+  # - phc: pseudo-Hilbert curve, fills the configured space from the first coordinate outward.
+  # - spiral: hexagonal spiral, starts at the first coordinate and grows ring by ring.
   - method: spiral
     count: LAST
     params: default
@@ -82,13 +97,12 @@ outputs:
 
 ## Interface
 
-- `Brain` tab: generate default brain YAML, edit/load/save brain YAML, and initialize the network.
-- `World` tab: select a world plugin, generate its default YAML through `GetDefaultConfig`, edit/load/save world YAML, and initialize the physical world.
+- `Config` tab: generate/edit/load/save the combined brain/world YAML, select a world plugin, inject its default config, and initialize the brain or world.
 - `Body` tab: view basic statistics.
 - Lower `Inputs` tab: edit input physical values and read output group activation ratios.
 - Bottom tabs: inspect the world view, selected-neuron CAS chart, active-count chart, neuron fields, selected-neuron input connectome, and inputs/outputs.
 
-Brain/world YAML is validated when loaded or saved. The editors also check model compatibility after changes: brain input names must be available as world output names, and world input names must be available as brain output names.
+Combined YAML is validated when loaded or saved. Brain and world validators return `(ok, problems)`, and the editor also checks model compatibility after changes: brain input names must be available as world output names, and world input names must be available as brain output names.
 
 Right-click or click neurons in the brain canvas to inspect state. Editable selected-neuron fields are applied on Enter or focus loss.
 

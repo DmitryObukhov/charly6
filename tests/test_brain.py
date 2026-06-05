@@ -6,7 +6,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from charly6.brain import Brain as CompatBrain
 from charly6.brain import Substrate as CompatSubstrate
+from charly6.brain import Validate
 from charly6.brain import create_random_brain
+from charly6.brain import create_spatial_brain
 from charly6.brain_model import Brain, Substrate
 from charly6.neuron import Neuron
 
@@ -61,6 +63,23 @@ def test_factory_returns_serializable_brain_model() -> None:
     assert restored == brain
 
 
+def test_spatial_factory_applies_initialization_defaults() -> None:
+    brain = create_spatial_brain(
+        [(0.0, 0.0), (0.1, 0.0)],
+        charge_max=100.0,
+        default_charge=75.0,
+        default_recharge=20.0,
+        default_eq_min=-0.1,
+        default_eq_max=0.1,
+        seed=1,
+    )
+
+    for neuron in brain.substrate.brain:
+        assert neuron.charge == 75.0
+        assert neuron.recharge == 20.0
+        assert -0.1 <= neuron.eq <= 0.1
+
+
 def test_brain_process_uses_layer_signal_status_and_weight() -> None:
     brain = Brain(
         substrate=Substrate(
@@ -80,3 +99,74 @@ def test_brain_process_uses_layer_signal_status_and_weight() -> None:
     assert dst.status == [True, True]
     assert dst.active is True
     assert dst.history[-1]["signal"] == 0.0
+
+
+def test_brain_process_preserves_neuron_references_after_copy_back() -> None:
+    source = Neuron(status=[True], signal=[2.0], charge=10.0)
+    dst = Neuron(trigger=[1.0], charge=5.0)
+    brain = Brain(substrate=Substrate(brain=[source, dst], connectome=[(0, 1, 1.0)]), charge_max=10.0)
+    original_refs = list(brain.substrate.brain)
+
+    brain.process()
+
+    assert brain.substrate.brain == original_refs
+    assert brain.substrate.brain[1] is dst
+    assert dst.active is True
+
+
+def test_activation_drops_charge_immediately_and_recharges_inactive_until_full() -> None:
+    source = Neuron(status=[True], signal=[2.0], charge=10.0)
+    dst = Neuron(trigger=[1.0], charge=5.0, charge_min=1.0, recharge=2.0, charge_max=10.0)
+    brain = Brain(substrate=Substrate(brain=[source, dst], connectome=[(0, 1, 1.0)]), charge_max=10.0)
+
+    brain.process()
+
+    assert dst.active is True
+    assert dst.drop_charge_next_cycle is True
+    assert dst.charge == 0.0
+
+    brain.process()
+
+    assert dst.active is False
+    assert dst.drop_charge_next_cycle is True
+    assert dst.charge == 2.0
+
+    for expected_charge in (4.0, 6.0, 8.0, 10.0):
+        brain.process()
+        assert dst.active is False
+        assert dst.charge == expected_charge
+
+    assert dst.drop_charge_next_cycle is False
+
+
+def test_charge_below_minimum_blocks_activation() -> None:
+    source = Neuron(status=[True], signal=[5.0], charge=10.0)
+    dst = Neuron(trigger=[1.0], charge=0.0, charge_min=1.0, recharge=0.0)
+    brain = Brain(substrate=Substrate(brain=[source, dst], connectome=[(0, 1, 1.0)]))
+
+    brain.process()
+
+    assert dst.signal[0] == 5.0
+    assert dst.active is False
+    assert dst.status == [False]
+
+
+def test_brain_validate_reports_problems() -> None:
+    ok, problems = Validate(
+        """
+ID: test
+brain:
+  neurons: 2
+assembly: []
+inputs: []
+outputs: []
+"""
+    )
+
+    assert ok is True
+    assert problems == []
+
+    ok, problems = Validate("brain:\n  neurons: 0\n")
+
+    assert ok is False
+    assert problems

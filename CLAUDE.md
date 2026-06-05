@@ -58,13 +58,13 @@ pyproject.toml
 ### GUI layer
 
 - `app.py` owns the `tk.Tk` root and all top-level frames.
-- Brain YAML is edited in the Brain tab and may be loaded/saved through the File menu or tab buttons.
+- Combined brain/world YAML is edited in the Config tab and may be loaded/saved through the File menu or tab buttons.
 - The app stores UI state in `charly6.config.yaml`, including selected tab, visualization/runtime values, and `last_yaml`.
 - Visualization settings may appear in legacy YAML files under `visualization`, `display`, or `runtime`, but they are stripped before saving brain YAML.
 - The canvas renders neurons using positions from YAML `assembly` steps. Active neurons are green, inactive neurons are dark, selected/input/head neurons have extra markers.
-- The Brain and World tabs each have a first `Default` button. Brain defaults come from `DEFAULT_BRAIN_CONFIG`; World defaults come from the selected plugin's `GetDefaultConfig`.
-- The World tab discovers plugins from `worlds/` by importing modules with `GetDefaultConfig`, shows them in a selector, and initializes/renders the selected or YAML `world.base` module.
-- Brain/world YAML loads and saves must validate required sections and report a specific error before accepting invalid YAML.
+- The Config tab has one combined editor. Brain defaults come from `DEFAULT_BRAIN_CONFIG`; world defaults are nested under `physical_world` from the selected plugin's `GetDefaultConfig`.
+- World plugins are discovered from `worlds/` by importing modules with `GetDefaultConfig`, shown in a selector, and initialized/rendered from the nested `physical_world` config.
+- Combined YAML loads and saves must validate required brain and world sections and report a specific error before accepting invalid YAML.
 - Compatibility is checked after editor changes: every brain input must be present in world outputs, and every world input must be present in brain outputs.
 - Runtime ticks use `root.after()`; no threads are used.
 - Current GUI step/tick callbacks apply input physical values, refresh output ratios/charts, and increment the iteration counter. They do not currently call `brain.process()`.
@@ -77,7 +77,7 @@ pyproject.toml
 - `worlds.linear` is the first implementation: a deterministic 2D visualization where the agent has one X coordinate, `stomach_content` in `0..10`, and moves left/right from normalized `left_motor` and `right_motor` inputs. It also has a `light` object with `x` and `brightness`.
 - World YAML uses one top-level `world` section for runtime and world settings (`base`, `dt`, `seed`, `input_validation`, `max_steps`, `dimensions`, `bounds`, `drag`); legacy top-level `simulation` remains readable but should not be emitted by defaults.
 - World `outputs` use mapping format: `output_name: source_field` (for example, `velocity: velocity`).
-- Keep the public API function names stable: `Init`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
+- Keep the public API function names stable: `Init`, `Validate`, `GetDefaultConfig`, `Process`, `GetParams`, `SetParam`, `SetParams`, and `GetVisualization`.
 - `GetVisualization` returns the module's lightweight raster `Image` type, avoiding extra runtime dependencies beyond PyYAML.
 
 ### YAML model
@@ -87,6 +87,7 @@ pyproject.toml
 - `inputs`: list or mapping of named inputs. Each input supports `center`, `radius`, `number`, `eq_min`, `eq_max`, and `value`/`physical_value`.
 - `outputs`: list or mapping of named output groups. Outputs can specify indices as a list, comma-separated string, or aliases `indices`, `actuators`, or `neurons`.
 - `transfer_function` may appear in YAML, but the current GUI does not consume it.
+- `physical_world` contains the selected world plugin's YAML (`world`, `objects`, `inputs`, and `outputs`).
 
 ## Key conventions
 

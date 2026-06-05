@@ -20,6 +20,18 @@ def test_init_accepts_default_config():
     assert params["x"] == "0.0"
 
 
+def test_validate_reports_problems():
+    ok, problems = linear.Validate(linear.GetDefaultConfig())
+
+    assert ok is True
+    assert problems == []
+
+    ok, problems = linear.Validate("world: {}\n")
+
+    assert ok is False
+    assert problems
+
+
 def test_process_returns_float_values():
     linear.Init(linear.GetDefaultConfig())
 
@@ -27,6 +39,15 @@ def test_process_returns_float_values():
 
     assert set(outputs) == {"velocity", "hunger", "light"}
     assert all(isinstance(value, float) for value in outputs.values())
+
+
+def test_first_process_accepts_none_without_advancing():
+    linear.Init(linear.GetDefaultConfig())
+
+    outputs = linear.Process(None)
+
+    assert set(outputs) == {"velocity", "hunger", "light"}
+    assert linear.GetParams()["step"] == "0"
 
 
 def test_outputs_accept_name_to_source_mapping():

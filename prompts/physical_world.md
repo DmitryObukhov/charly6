@@ -15,6 +15,13 @@ def GetDefaultConfig() -> str:
     Эта конфигурация должна быть валидной и достаточной для запуска модели без изменений.
     """
 
+def Validate(config_yaml: str) -> tuple[bool, list[str]]:
+    """
+    Validates world YAML without changing runtime state.
+    Return (True, []) when valid. Return (False, problems) when invalid.
+    problems must be a list of human-readable strings.
+    """
+
 def Process(inputs: dict[str, float]) -> dict[str, float]:
     """
     Получает словарь входных управляющих сигналов.
