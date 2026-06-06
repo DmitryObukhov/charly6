@@ -47,10 +47,26 @@ outputs:
   - left_motor: [0, 1, 2, 3, 4]
   - right_motor: [5, 6, 7, 8, 9]
 
-# --------------------------------------------------- Transfer function
-transfer_function:
-  time_step: 0.1
-  total_time: 100.0
+# --------------------------------------------------- Body
+# Translates physical world outputs into counts of brain input neurons to activate.
+# formula: linear, inverse_linear, or threshold.
+# count = round(clamp((value - min) / (max - min), 0..1) * input_neuron_count)
+body:
+  mappings:
+    - target: hunger
+      source: hunger
+      formula: linear
+      min: 0.0
+      max: 100.0
+      clamp: true
+      rounding: round
+    - target: light
+      source: light
+      formula: linear
+      min: 0.0
+      max: 10.0
+      clamp: true
+      rounding: round
 
 # --------------------------------------------------- Physical world
 physical_world:

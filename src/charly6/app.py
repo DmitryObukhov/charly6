@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import importlib
-import csv
 import json
 import math
 import pkgutil
 import random
 import re
+import sqlite3
 import tkinter as tk
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from charly6.body import Body, BodyTranslation
 from charly6.brain import Brain, create_spatial_brain
 import worlds
 
@@ -25,6 +26,7 @@ CONFIG_PATH = Path("charly6.config.yaml")
 LOG_DIR = Path("logs")
 RUNTIME_DIR = Path("runtime")
 WORLD_CONFIG_SECTION = "physical_world"
+BODY_CONFIG_SECTION = "body"
 
 try:
     import yaml
@@ -78,6 +80,32 @@ DEFAULT_BRAIN_CONFIG: dict = {
             "eq_max": -100,
         },
     ],
+    "outputs": [
+        {"left_motor": [0, 1, 2, 3, 4]},
+        {"right_motor": [5, 6, 7, 8, 9]},
+    ],
+    "body": {
+        "mappings": [
+            {
+                "target": "hunger",
+                "source": "hunger",
+                "formula": "linear",
+                "min": 0.0,
+                "max": 10.0,
+                "clamp": True,
+                "rounding": "round",
+            },
+            {
+                "target": "light",
+                "source": "light",
+                "formula": "linear",
+                "min": 0.0,
+                "max": 10.0,
+                "clamp": True,
+                "rounding": "round",
+            },
+        ],
+    },
 }
 
 DEFAULT_VISUALIZATION_CONFIG: dict = {
@@ -131,6 +159,14 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         json.dump(data, file, ensure_ascii=False, separators=(",", ":"))
         file.write("\n")
     tmp_path.replace(path)
+
+
+def _json_list_length(text: str) -> int:
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return 0
+    return len(value) if isinstance(value, list) else 0
 
 
 def _split_visualization_sections(cfg: dict) -> tuple[dict, dict]:
@@ -352,6 +388,8 @@ class App(tk.Tk):
         self._input_indices: set[int] = set()
         self._input_specs: list[dict] = []
         self._output_specs: list[dict] = []
+        self._body: Body | None = None
+        self._last_active_input_indices: list[list[int]] = []
         self._input_value_vars: dict[str, tk.StringVar] = {}
         self._output_value_vars: dict[str, tk.StringVar] = {}
         self._inputs_editor_frame: ttk.Frame | None = None
@@ -370,7 +408,6 @@ class App(tk.Tk):
         self._cas_active: deque[float] = deque(maxlen=1000)
         self._cas_signal: deque[float] = deque(maxlen=1000)
         self._logic_history_path: Path | None = None
-        self._logic_history_csv_path: Path | None = None
         self._logic_history_rows: deque[dict] = deque(maxlen=1000)
         self._history_tree: ttk.Treeview | None = None
         self._history_detail_text: scrolledtext.ScrolledText | None = None
@@ -581,7 +618,7 @@ class App(tk.Tk):
         p.columnconfigure(0, weight=1)
         p.rowconfigure(0, weight=1)
 
-        editor_frame = ttk.LabelFrame(p, text=" Brain + world config YAML ")
+        editor_frame = ttk.LabelFrame(p, text=" Brain + body + world config YAML ")
         editor_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
         editor_frame.rowconfigure(0, weight=1)
         editor_frame.columnconfigure(0, weight=1)
@@ -828,52 +865,111 @@ class App(tk.Tk):
             raise ValueError("Brain ID is not set.")
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         safe_id = _runtime_safe_id(self._brain_id)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = RUNTIME_DIR / f"{safe_id}_logic_{timestamp}"
-        counter = 1
-        while path.exists():
-            path = RUNTIME_DIR / f"{safe_id}_logic_{timestamp}_{counter}"
-            counter += 1
-        path.touch()
-        return path
+        return RUNTIME_DIR / f"{safe_id}_logic.sqlite"
 
     def _start_logic_history(self) -> None:
         try:
             self._logic_history_path = self._create_logic_history_path()
-            self._logic_history_csv_path = self._logic_history_path.with_suffix(".csv")
-            self._write_logic_history_csv_header()
-        except (OSError, ValueError) as exc:
+            self._cleanup_legacy_logic_history_files()
+            self._migrate_logic_history_db()
+            self._initialize_logic_history_db()
+        except (OSError, ValueError, sqlite3.Error) as exc:
             self._logic_history_path = None
-            self._logic_history_csv_path = None
             self._history_status_var.set(f"Logic history unavailable: {exc}")
             self._log(f"Logic history initialization failed: {exc}")
             return
         self._logic_history_rows.clear()
-        self._history_status_var.set(
-            f"Logic history: {self._logic_history_path} | CSV: {self._logic_history_csv_path}"
-        )
+        self._history_status_var.set(f"Logic history DB: {self._logic_history_path}")
         self._refresh_history_view()
-        self._log(f"Opened logic history {self._logic_history_path} and {self._logic_history_csv_path}")
+        self._log(f"Opened logic history DB {self._logic_history_path}")
 
-    def _write_logic_history_csv_header(self) -> None:
-        if self._logic_history_csv_path is None:
-            raise ValueError("Logic history CSV path is not set.")
-        with self._logic_history_csv_path.open("w", encoding="utf-8", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "iteration",
-                "brain_iteration",
-                "timestamp",
-                "CES_pos",
-                "CES_neg",
-                "physical_inputs",
-                "physical_outputs",
-                "neuron_index",
-                "active",
-                "trigger0",
-                "signal0",
-                "charge",
-            ])
+    def _cleanup_legacy_logic_history_files(self) -> None:
+        if self._brain_id is None or self._logic_history_path is None:
+            return
+        safe_id = _runtime_safe_id(self._brain_id)
+        for path in RUNTIME_DIR.glob(f"{safe_id}_logic_*"):
+            if path.resolve() == self._logic_history_path.resolve():
+                continue
+            if path.is_file():
+                path.unlink()
+
+    def _initialize_logic_history_db(self) -> None:
+        if self._logic_history_path is None:
+            raise ValueError("Logic history DB path is not set.")
+        if self._brain is None:
+            raise ValueError("Brain is not initialized.")
+        with sqlite3.connect(self._logic_history_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS neuron_history")
+            conn.execute("DROP TABLE IF EXISTS physical_io")
+            conn.execute("DROP TABLE IF EXISTS iterations")
+            conn.execute("DROP TABLE IF EXISTS metadata")
+            conn.execute("""
+                CREATE TABLE iterations (
+                    iteration INTEGER PRIMARY KEY,
+                    brain_iteration INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    CES_neg REAL NOT NULL,
+                    CES_pos REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE neuron_history (
+                    iteration INTEGER NOT NULL,
+                    neuron_idx INTEGER NOT NULL,
+                    active INTEGER NOT NULL,
+                    signal REAL NOT NULL,
+                    trigger REAL NOT NULL,
+                    active_inputs INTEGER NOT NULL,
+                    active_input_indices TEXT NOT NULL,
+                    PRIMARY KEY (iteration, neuron_idx),
+                    FOREIGN KEY (iteration) REFERENCES iterations(iteration)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE physical_io (
+                    iteration INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    PRIMARY KEY (iteration, direction, name),
+                    FOREIGN KEY (iteration) REFERENCES iterations(iteration)
+                )
+            """)
+            conn.execute(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                [
+                    ("format", "charly6.logic_history.sqlite.v2"),
+                    ("id", str(self._brain_id)),
+                    ("created_at", datetime.now().isoformat(timespec="seconds")),
+                    ("neuron_count", str(len(self._brain.substrate.brain))),
+                ],
+            )
+
+    def _migrate_logic_history_db(self) -> None:
+        if self._logic_history_path is None or not self._logic_history_path.exists():
+            return
+        with sqlite3.connect(self._logic_history_path) as conn:
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='neuron_history'"
+            ).fetchone()
+            if table is None:
+                return
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(neuron_history)").fetchall()
+            }
+            if "active_input_indices" in columns and "active_inputs" not in columns:
+                conn.create_function("json_list_length", 1, _json_list_length)
+                conn.execute("ALTER TABLE neuron_history ADD COLUMN active_inputs INTEGER NOT NULL DEFAULT 0")
+                conn.execute(
+                    """
+                    UPDATE neuron_history
+                    SET active_inputs = json_list_length(active_input_indices)
+                    """
+                )
 
     def _save_runtime_state(self) -> None:
         if self._brain is None:
@@ -912,6 +1008,36 @@ class App(tk.Tk):
         outputs = self._brain_output_values()
         return {"inputs": inputs, "outputs": outputs}
 
+    def _active_input_indices(self) -> list[list[int]]:
+        if self._brain is None:
+            return []
+        neurons = self._brain.substrate.brain
+        indices: list[list[int]] = [[] for _ in neurons]
+        for src_idx, dst_idx, weight in self._brain.substrate.connectome:
+            if src_idx >= len(neurons) or dst_idx >= len(neurons):
+                continue
+            src = neurons[src_idx]
+            if not src.status or not src.status[0]:
+                continue
+            if not src.signal or src.signal[0] * float(weight) == 0.0:
+                continue
+            indices[dst_idx].append(src_idx)
+        return indices
+
+    def _logic_history_active_input_indices(self) -> list[list[int]]:
+        if self._brain is None:
+            return []
+        neurons = self._brain.substrate.brain
+        last_indices = object.__getattribute__(self, "__dict__").get(
+            "_last_active_input_indices", []
+        )
+        if len(last_indices) == len(neurons):
+            return last_indices
+        return self._active_input_indices()
+
+    def _update_last_active_input_indices(self) -> None:
+        self._last_active_input_indices = self._active_input_indices()
+
     def _logic_history_record(self) -> dict:
         if self._brain is None:
             raise ValueError("Brain is not initialized.")
@@ -919,6 +1045,7 @@ class App(tk.Tk):
         active_neurons = [neuron for neuron in neurons if neuron.active]
         ces_pos = sum(neuron.eq for neuron in active_neurons if neuron.eq > 0.0)
         ces_neg = sum(neuron.eq for neuron in active_neurons if neuron.eq < 0.0)
+        active_input_indices = self._logic_history_active_input_indices()
         return {
             "format": "charly6.logic_history.v1",
             "id": self._brain_id,
@@ -934,6 +1061,7 @@ class App(tk.Tk):
                     "active": neuron.active,
                     "trigger0": neuron.trigger[0] if neuron.trigger else 0.0,
                     "signal0": neuron.signal[0] if neuron.signal else 0.0,
+                    "active_input_indices": active_input_indices[idx] if idx < len(active_input_indices) else [],
                     "charge": neuron.charge,
                 }
                 for idx, neuron in enumerate(neurons)
@@ -949,48 +1077,72 @@ class App(tk.Tk):
                 return
         try:
             record = self._logic_history_record()
-            with self._logic_history_path.open("a", encoding="utf-8") as file:
-                json.dump(record, file, ensure_ascii=False, separators=(",", ":"))
-                file.write("\n")
-        except (OSError, TypeError, ValueError) as exc:
-            self._log(f"Logic history save failed: {exc}")
-            self._history_status_var.set(f"Logic history save failed: {exc}")
-            return
-        try:
-            self._append_logic_history_csv(record)
-        except (OSError, TypeError, ValueError) as exc:
-            self._log(f"Logic history CSV save failed: {exc}")
-            self._history_status_var.set(f"Logic history CSV save failed: {exc}")
+            self._append_logic_history_db(record)
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            self._log(f"Logic history DB save failed: {exc}")
+            self._history_status_var.set(f"Logic history DB save failed: {exc}")
             return
         self._logic_history_rows.append(record)
-        self._history_status_var.set(
-            f"Logic history: {self._logic_history_path} | CSV: {self._logic_history_csv_path}"
-        )
+        self._history_status_var.set(f"Logic history DB: {self._logic_history_path}")
         self._refresh_history_view()
 
-    def _append_logic_history_csv(self, record: dict) -> None:
-        if self._logic_history_csv_path is None:
-            raise ValueError("Logic history CSV path is not set.")
+    def _append_logic_history_db(self, record: dict) -> None:
+        if self._logic_history_path is None:
+            raise ValueError("Logic history DB path is not set.")
         interface = record.get("physical_interface", {})
-        physical_inputs = json.dumps(interface.get("inputs", {}), ensure_ascii=False, separators=(",", ":"))
-        physical_outputs = json.dumps(interface.get("outputs", {}), ensure_ascii=False, separators=(",", ":"))
-        with self._logic_history_csv_path.open("a", encoding="utf-8", newline="") as file:
-            writer = csv.writer(file)
-            for neuron in record.get("neurons", []):
-                writer.writerow([
-                    record.get("iteration", ""),
-                    record.get("brain_iteration", ""),
+        inputs = interface.get("inputs", {})
+        outputs = interface.get("outputs", {})
+        with sqlite3.connect(self._logic_history_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO iterations
+                    (iteration, brain_iteration, timestamp, CES_neg, CES_pos)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.get("iteration", 0),
+                    record.get("brain_iteration", 0),
                     record.get("timestamp", ""),
-                    record.get("CES_pos", 0.0),
                     record.get("CES_neg", 0.0),
-                    physical_inputs,
-                    physical_outputs,
-                    neuron.get("index", ""),
-                    neuron.get("active", ""),
-                    neuron.get("trigger0", ""),
-                    neuron.get("signal0", ""),
-                    neuron.get("charge", ""),
-                ])
+                    record.get("CES_pos", 0.0),
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO physical_io
+                    (iteration, direction, name, value)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (record.get("iteration", 0), "input", str(name), float(value))
+                    for name, value in inputs.items()
+                ] + [
+                    (record.get("iteration", 0), "output", str(name), float(value))
+                    for name, value in outputs.items()
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO neuron_history
+                    (iteration, neuron_idx, active, signal, trigger, active_inputs, active_input_indices)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record.get("iteration", 0),
+                        int(neuron.get("index", 0)),
+                        1 if neuron.get("active", False) else 0,
+                        float(neuron.get("signal0", 0.0)),
+                        float(neuron.get("trigger0", 0.0)),
+                        len(neuron.get("active_input_indices", [])),
+                        json.dumps(
+                            [int(idx) for idx in neuron.get("active_input_indices", [])],
+                            separators=(",", ":"),
+                        ),
+                    )
+                    for neuron in record.get("neurons", [])
+                ],
+            )
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1094,9 +1246,7 @@ class App(tk.Tk):
                 ),
             )
         if self._logic_history_path is not None:
-            self._history_status_var.set(
-                f"Logic history: {self._logic_history_path} | CSV: {self._logic_history_csv_path}"
-            )
+            self._history_status_var.set(f"Logic history DB: {self._logic_history_path}")
 
     def _physical_interface_summary(self, interface: dict) -> str:
         parts: list[str] = []
@@ -1481,6 +1631,22 @@ class App(tk.Tk):
             return False, [str(exc)]
         return True, []
 
+    def _validate_body_config(
+        self,
+        cfg: dict,
+        *,
+        world_outputs: set[str] | None = None,
+    ) -> tuple[bool, list[str]]:
+        brain_inputs, _ = self._brain_interface_names(cfg)
+        ok, problems = Body.Validate(
+            cfg.get(BODY_CONFIG_SECTION),
+            brain_inputs=brain_inputs,
+            world_outputs=world_outputs,
+        )
+        if not ok:
+            raise ValueError("; ".join(problems))
+        return ok, problems
+
     def _load_default_brain_yaml(self) -> None:
         self._brain_yaml_path = None
         self._set_brain_yaml_text(_dump_yaml(self._default_combined_config()))
@@ -1503,6 +1669,7 @@ class App(tk.Tk):
         self._require_section(cfg, "assembly")
         self._require_section(cfg, "inputs")
         self._require_section(cfg, "outputs")
+        self._require_mapping_section(cfg, BODY_CONFIG_SECTION)
         brain_cfg = cfg["brain"]
         target_n = self._yaml_int(brain_cfg, "neurons", minimum=1)
         self._yaml_int(brain_cfg, "head_size", default=0, minimum=0)
@@ -1518,6 +1685,7 @@ class App(tk.Tk):
         positions = self._assembly_positions(cfg, target_n)
         self._validate_input_specs(cfg, len(positions))
         self._initialize_outputs(cfg, len(positions))
+        self._validate_body_config(cfg)
 
     def _require_section(self, cfg: dict, name: str):
         if name not in cfg:
@@ -1647,12 +1815,14 @@ class App(tk.Tk):
 
         brain_inputs, brain_outputs = self._brain_interface_names(brain_cfg)
         world_inputs, world_outputs = self._world_interface_names(world_cfg)
-        missing_world_outputs = sorted(brain_inputs - world_outputs)
+        try:
+            self._validate_body_config(brain_cfg, world_outputs=world_outputs)
+        except ValueError as exc:
+            self._compat_status_label.config(text=f"Incompatible: {exc}", foreground="red")
+            return False
         missing_brain_outputs = sorted(world_inputs - brain_outputs)
-        if missing_world_outputs or missing_brain_outputs:
+        if missing_brain_outputs:
             parts = []
-            if missing_world_outputs:
-                parts.append(f"world outputs missing: {', '.join(missing_world_outputs)}")
             if missing_brain_outputs:
                 parts.append(f"brain outputs missing: {', '.join(missing_brain_outputs)}")
             self._compat_status_label.config(text="Incompatible: " + "; ".join(parts), foreground="red")
@@ -2424,6 +2594,7 @@ class App(tk.Tk):
             input_rng = random.Random(seed) if seed is not None else random.Random()
             input_indices, input_specs = self._initialize_inputs(brain, positions, cfg, n, input_rng)
             output_specs = self._initialize_outputs(cfg, n)
+            body = Body.from_config(cfg.get(BODY_CONFIG_SECTION))
         except (TypeError, ValueError) as exc:
             messagebox.showerror("Init", f"Invalid brain YAML:\n{exc}")
             self._status_label.config(text="Invalid YAML", foreground="red")
@@ -2451,6 +2622,8 @@ class App(tk.Tk):
         self._input_indices = input_indices
         self._input_specs = input_specs
         self._output_specs = output_specs
+        self._body = body
+        self._last_active_input_indices = [[] for _ in brain.substrate.brain]
         self._input_value_vars = {}
         self._output_value_vars = {}
         self._adj_in = adj_in
@@ -2872,7 +3045,25 @@ class App(tk.Tk):
             self._status_label.config(text=f"Invalid input value: {input_name}", foreground="red")
             return
         spec["value"] = value
+        if self._body is None:
+            self._log(f"Physical input translation skipped: body is not initialized")
+            return
+        mapping = self._body.mapping_for_target(input_name)
+        if mapping is None:
+            self._log(f"Physical input translation skipped: no body mapping for {input_name!r}")
+            return
+        translation = self._body.translate_value(mapping, value, spec)
+        self._apply_body_translation(translation, redraw=redraw)
+
+    def _apply_body_translation(self, translation: BodyTranslation, *, redraw: bool = True) -> None:
+        if self._brain is None:
+            return
+        spec = next((item for item in self._input_specs if item["name"] == translation.target), None)
+        if spec is None:
+            return
+        spec["value"] = translation.value
         neurons = self._brain.substrate.brain
+        active_indices = set(translation.indices)
         positive_lines: list[str] = []
         negative_example: str | None = None
         negative_example_uses_valid_target = False
@@ -2886,28 +3077,25 @@ class App(tk.Tk):
                 previous_status = list(neuron.status)
                 previous_signal = list(neuron.signal)
                 previous_charge = neuron.charge
-                threshold = neuron.trigger[0] + neuron.trigger_flex + neuron.eq
-                charge = min(neuron.charge_max, max(0.0, value))
-                can_activate = charge >= neuron.charge_min
-                active = can_activate and value > threshold
-                neuron.charge = charge
-                neuron.signal[0] = value
+                active = idx in active_indices
+                neuron.charge = neuron.charge_max if active else 0.0
+                neuron.signal[0] = translation.value if active else 0.0
                 neuron.active = active
+                if active:
+                    neuron.drop_charge_next_cycle = False
                 detail = (
                     f"idx={idx} name={neuron.name!r} "
                     f"previous_active={previous_active} "
                     f"previous_status={previous_status} "
                     f"previous_signal={previous_signal} "
                     f"previous_charge={previous_charge:.6f} "
-                    f"input_signal={value:.6f} "
+                    f"input_signal={neuron.signal[0]:.6f} "
                     f"charge={neuron.charge:.6f} "
                     f"charge_min={neuron.charge_min:.6f} "
                     f"charge_max={neuron.charge_max:.6f} "
-                    f"can_activate={can_activate} "
                     f"trigger0={neuron.trigger[0]:.6f} "
                     f"trigger_flex={neuron.trigger_flex:.6f} "
                     f"eq={neuron.eq:.6f} "
-                    f"threshold={threshold:.6f} "
                     f"active={neuron.active} "
                     f"status={neuron.status} "
                     f"drop_charge_next_cycle={neuron.drop_charge_next_cycle}"
@@ -2927,8 +3115,11 @@ class App(tk.Tk):
                     )
         lines = [
             (
-                f"Physical input translation: input={input_name!r} "
-                f"value={value:.6f} target_indices={len(spec['indices'])} "
+                f"Physical input translation: input={translation.target!r} "
+                f"source={translation.source!r} value={translation.value:.6f} "
+                f"normalized={translation.normalized:.6f} "
+                f"target_indices={len(spec['indices'])} active_count={translation.count} "
+                f"active_indices={translation.indices} "
                 f"valid_targets={valid_targets} became_active={became_active_count}"
             )
         ]
@@ -2996,9 +3187,9 @@ class App(tk.Tk):
             ]
         return inputs, outputs
 
-    def _process_world_cycle(self) -> None:
+    def _read_physical_model_values(self) -> dict[str, float] | None:
         if not self._world_initialized:
-            return
+            return None
         input_names, output_names = self._world_interface_spec_names()
         if self._world_first_process_pending:
             world_inputs = None
@@ -3013,17 +3204,10 @@ class App(tk.Tk):
             self._world_status_label.config(text="Process failed", foreground="red")
             self._log(f"World process failed: {exc}")
             self._draw_world()
-            return
+            return None
         if not isinstance(world_outputs, dict):
             self._log(f"World process returned non-mapping outputs: {world_outputs!r}")
-            return
-        for spec in self._input_specs:
-            if spec["name"] in world_outputs:
-                value = float(world_outputs[spec["name"]])
-                spec["value"] = value
-                var = self._input_value_vars.get(spec["name"])
-                if var is not None:
-                    var.set(f"{value:.6f}")
+            return None
         logged_inputs = (
             "None"
             if world_inputs is None
@@ -3035,6 +3219,43 @@ class App(tk.Tk):
         )
         self._log(f"World process inputs: {logged_inputs}")
         self._log(f"World process outputs: {logged_outputs}")
+        return {str(name): float(value) for name, value in world_outputs.items()}
+
+    def _apply_physical_outputs_to_input_neurons(self, world_outputs: dict[str, float] | None) -> None:
+        if world_outputs is None:
+            self._apply_all_input_values()
+            return
+        body_translations: dict[str, BodyTranslation] = {}
+        if self._body is not None:
+            body_translations = self._body.translate(world_outputs, self._input_specs)
+        for target, translation in body_translations.items():
+            var = self._input_value_vars.get(target)
+            if var is not None:
+                var.set(f"{translation.value:.6f}")
+            self._apply_body_translation(translation, redraw=False)
+        if body_translations:
+            self._log(
+                "Body translations: "
+                + "; ".join(
+                    f"{target}: source={translation.source} value={translation.value:.6f} "
+                    f"count={translation.count} indices={translation.indices}"
+                    for target, translation in body_translations.items()
+                )
+            )
+
+    def _read_brain_output_scalars(self) -> dict[str, float]:
+        outputs = self._brain_output_values()
+        self._refresh_output_values()
+        if outputs:
+            self._log(
+                "Brain output scalars: "
+                + ", ".join(f"{name}={value:.6f}" for name, value in outputs.items())
+            )
+        return outputs
+
+    def _process_world_cycle(self) -> None:
+        world_outputs = self._read_physical_model_values()
+        self._apply_physical_outputs_to_input_neurons(world_outputs)
         self._draw_world()
 
     def _spread_value(self, min_value: float, max_value: float, offset: int, count: int) -> float:
@@ -3114,18 +3335,41 @@ class App(tk.Tk):
             self._log("Simulation paused")
 
     def _on_step(self) -> None:
-        if self._brain:
-            self._apply_all_input_values()
-            self._process_brain_with_selected_neuron_log()
-            self._iteration += 1
-            self._save_runtime_state()
-            self._record_history()
-            self._refresh_charts()
-            self._refresh_output_values()
-            self._process_world_cycle()
-            self._append_logic_history()
-            self._update_iteration_display()
+        if self._run_simulation_cycle():
             self._log(f"Simulation stepped to iteration {self._iteration}")
+
+    def _run_simulation_cycle(self) -> bool:
+        if not self._brain:
+            return False
+        self._iteration += 1
+
+        # 1. Read values from physical model and update io table and input value vars
+        world_outputs = self._read_physical_model_values()
+
+        # 2. Apply input values to neurons (body translation and logging)
+        self._apply_physical_outputs_to_input_neurons(world_outputs)
+
+        # 3. Process brain with selected neuron log
+        self._process_brain_with_selected_neuron_log()
+
+        # 4. Read brain outputs and translate number neurons to scalars
+        self._read_brain_output_scalars()
+
+        # 5. Save runtime state (for potential rewinding)
+        self._save_runtime_state()
+
+        # 6. Record history (for potential rewinding and charts)
+        self._record_history()
+
+        # 7. Refresh charts (with new history)
+        self._refresh_charts()
+
+        # 8. Save detailed logic history
+        self._append_logic_history()
+        self._update_iteration_display()
+        if self._world_initialized:
+            self._draw_world()
+        return True
 
     def _on_reset(self) -> None:
         self._on_stop()
@@ -3137,17 +3381,7 @@ class App(tk.Tk):
     def _tick(self) -> None:
         if not self._running:
             return
-        if self._brain:
-            self._apply_all_input_values()
-            self._process_brain_with_selected_neuron_log()
-            self._iteration += 1
-            self._save_runtime_state()
-            self._record_history()
-            self._refresh_charts()
-            self._refresh_output_values()
-            self._process_world_cycle()
-            self._append_logic_history()
-            self._update_iteration_display()
+        self._run_simulation_cycle()
         interval = int(self._vars["tick_ms"].get())
         self._tick_id = self.after(interval, self._tick)
 
@@ -3202,6 +3436,7 @@ class App(tk.Tk):
         if self._brain is None:
             return
         self._apply_runtime_active_overrides()
+        self._update_last_active_input_indices()
         selected_idx = self._cas_neuron_idx
         if selected_idx is None or selected_idx >= len(self._brain.substrate.brain):
             self._brain.process()
