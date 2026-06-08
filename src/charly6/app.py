@@ -8,7 +8,9 @@ import math
 import pkgutil
 import random
 import re
+import shutil
 import sqlite3
+import subprocess
 import tkinter as tk
 from collections import deque
 from datetime import datetime
@@ -379,6 +381,17 @@ class App(tk.Tk):
         self._vars["tick_ms"] = tk.IntVar(value=100)
         self._vars["max_iter"] = tk.IntVar(value=0)
         self._vars["seq_window"] = tk.IntVar(value=9)
+        self._vars["avg_activity_window"] = tk.IntVar(value=100)
+        self._vars["summary_depth"] = tk.IntVar(value=1000)
+        self._vars["summary_show_active"] = tk.BooleanVar(value=True)
+        self._vars["summary_show_inputs"] = tk.BooleanVar(value=True)
+        self._vars["summary_show_ces_pos"] = tk.BooleanVar(value=True)
+        self._vars["summary_show_ces_neg"] = tk.BooleanVar(value=True)
+        self._vars["record_video"] = tk.BooleanVar(value=False)
+        self._vars["video_fps"] = tk.IntVar(value=30)
+        self._vars["video_file"] = tk.StringVar(value="")
+        self._vars["video_summary_on_map"] = tk.BooleanVar(value=False)
+        self._vars["video_summary_height"] = tk.IntVar(value=40)
         self._brain: Brain | None = None
         self._brain_id: str | None = None
         self._runtime_active_overrides: dict[int, bool] = {}
@@ -401,7 +414,11 @@ class App(tk.Tk):
         self._seq_label: ttk.Label | None = None
         self._circle_radius: float = 3.0
         # chart history (last 1000 ticks)
-        self._act_history: deque[int] = deque(maxlen=1000)
+        self._act_history: deque[float] = deque(maxlen=1000)
+        self._active_input_history: deque[float] = deque(maxlen=1000)
+        self._ces_pos_history: deque[float] = deque(maxlen=1000)
+        self._ces_neg_history: deque[float] = deque(maxlen=1000)
+        self._last_active_input_count: int = 0
         self._cas_neuron_idx: int | None = None
         self._highlight_neuron_idx: int | None = None
         self._cas_charge: deque[float] = deque(maxlen=1000)
@@ -409,6 +426,10 @@ class App(tk.Tk):
         self._cas_signal: deque[float] = deque(maxlen=1000)
         self._logic_history_path: Path | None = None
         self._logic_history_rows: deque[dict] = deque(maxlen=1000)
+        self._video_recording: bool = False
+        self._video_frame_dir: Path | None = None
+        self._video_frame_count: int = 0
+        self._video_output_path: Path | None = None
         self._history_tree: ttk.Treeview | None = None
         self._history_detail_text: scrolledtext.ScrolledText | None = None
         self._history_status_var = tk.StringVar(value="No logic history file")
@@ -524,12 +545,17 @@ class App(tk.Tk):
 
         brain_frame = ttk.LabelFrame(self._viz_pane, text=" Brain ")
         self._viz_pane.add(brain_frame, weight=1)
-        # Info bar packed first so canvas fills the remainder
         self._neuron_info_label = ttk.Label(
             brain_frame, text="", font=("Courier", 9), anchor="w", foreground="#888888"
         )
         self._neuron_info_label.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 2))
-        self._brain_canvas = tk.Canvas(brain_frame, bg="#0d1117")
+
+        self._brain_top_nb = ttk.Notebook(brain_frame)
+        self._brain_top_nb.pack(fill=tk.BOTH, expand=True)
+
+        brain_map_tab = ttk.Frame(self._brain_top_nb)
+        self._brain_top_nb.add(brain_map_tab, text=" Brain Map ")
+        self._brain_canvas = tk.Canvas(brain_map_tab, bg="#0d1117")
         self._brain_canvas.pack(fill=tk.BOTH, expand=True)
         self._brain_canvas.bind("<Configure>",      self._on_brain_resize)
         self._brain_canvas.bind("<MouseWheel>",      self._on_brain_scroll)
@@ -537,6 +563,23 @@ class App(tk.Tk):
         self._brain_canvas.bind("<B1-Motion>",       self._on_brain_drag)
         self._brain_canvas.bind("<ButtonRelease-1>", self._on_brain_drag_end)
         self._brain_canvas.bind("<Button-3>",        self._on_brain_right_click)
+
+        brain_avg_tab = ttk.Frame(self._brain_top_nb)
+        self._brain_top_nb.add(brain_avg_tab, text=" Brain Average ")
+        avg_controls = ttk.Frame(brain_avg_tab)
+        avg_controls.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
+        ttk.Label(avg_controls, text="N").pack(side=tk.LEFT, padx=(0, 4))
+        self._avg_activity_entry = ttk.Entry(
+            avg_controls,
+            textvariable=self._vars["avg_activity_window"],
+            width=6,
+        )
+        self._avg_activity_entry.pack(side=tk.LEFT)
+        self._avg_activity_entry.bind("<Return>", lambda _event: self._draw_brain_average())
+        self._avg_activity_entry.bind("<FocusOut>", lambda _event: self._draw_brain_average())
+        self._brain_average_canvas = tk.Canvas(brain_avg_tab, bg="#0d1117")
+        self._brain_average_canvas.pack(fill=tk.BOTH, expand=True)
+        self._brain_average_canvas.bind("<Configure>", self._draw_brain_average)
 
         self._bottom_nb = ttk.Notebook(self._viz_pane)
         self._viz_pane.add(self._bottom_nb, weight=1)
@@ -554,7 +597,45 @@ class App(tk.Tk):
         self._cas_canvas.bind("<Configure>", self._draw_cas)
 
         act_tab = ttk.Frame(self._bottom_nb)
-        self._bottom_nb.add(act_tab, text=" Active count ")
+        self._bottom_nb.add(act_tab, text=" Activity Summary ")
+        act_controls = ttk.Frame(act_tab)
+        act_controls.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
+        for key, label in (
+            ("summary_show_active", "Active count %"),
+            ("summary_show_inputs", "Active input neurons"),
+            ("summary_show_ces_pos", "CES pos"),
+            ("summary_show_ces_neg", "CES neg"),
+        ):
+            ttk.Checkbutton(
+                act_controls,
+                text=label,
+                variable=self._vars[key],
+                command=self._draw_act_count,
+            ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(act_controls, text="Depth").pack(side=tk.LEFT, padx=(8, 4))
+        self._summary_depth_entry = ttk.Entry(
+            act_controls,
+            textvariable=self._vars["summary_depth"],
+            width=7,
+        )
+        self._summary_depth_entry.pack(side=tk.LEFT)
+        self._summary_depth_entry.bind("<Return>", lambda _event: self._draw_act_count())
+        self._summary_depth_entry.bind("<FocusOut>", lambda _event: self._draw_act_count())
+        ttk.Checkbutton(
+            act_controls,
+            text="On map",
+            variable=self._vars["video_summary_on_map"],
+            command=self._draw_brain,
+        ).pack(side=tk.LEFT, padx=(10, 3))
+        ttk.Label(act_controls, text="Height").pack(side=tk.LEFT, padx=(8, 3))
+        self._video_summary_height_entry = ttk.Entry(
+            act_controls,
+            textvariable=self._vars["video_summary_height"],
+            width=5,
+        )
+        self._video_summary_height_entry.pack(side=tk.LEFT, padx=3)
+        self._video_summary_height_entry.bind("<Return>", lambda _event: self._draw_brain())
+        self._video_summary_height_entry.bind("<FocusOut>", lambda _event: self._draw_brain())
         self._act_canvas = tk.Canvas(act_tab, bg="#0d1117")
         self._act_canvas.pack(fill=tk.BOTH, expand=True)
         self._act_canvas.bind("<Configure>", self._draw_act_count)
@@ -606,12 +687,23 @@ class App(tk.Tk):
         ttk.Button(btn_row, text="▶  Run", command=self._on_start).pack(side=tk.LEFT, padx=3)
         ttk.Button(btn_row, text="⏭  Step", command=self._on_step).pack(side=tk.LEFT, padx=3)
 
+        video_row = ttk.Frame(ctrl)
+        video_row.pack(padx=8, pady=(0, 6), anchor="center", fill=tk.X)
+        ttk.Checkbutton(video_row, text="Record video", variable=self._vars["record_video"]).pack(side=tk.LEFT, padx=3)
+        ttk.Label(video_row, text="FPS").pack(side=tk.LEFT, padx=(10, 3))
+        ttk.Entry(video_row, textvariable=self._vars["video_fps"], width=5).pack(side=tk.LEFT, padx=3)
+        ttk.Label(video_row, text="File").pack(side=tk.LEFT, padx=(10, 3))
+        self._video_file_entry = ttk.Entry(video_row, textvariable=self._vars["video_file"], width=42)
+        self._video_file_entry.pack(side=tk.LEFT, padx=3, fill=tk.X, expand=True)
+        self._vars["video_file"].set(str(self._default_video_path()))
+
         self._iter_label = ttk.Label(ctrl, text="Iteration: 0", foreground="gray")
         self._iter_label.pack(padx=8, pady=(0, 6), anchor="center")
 
     def _update_iteration_display(self) -> None:
         self._iter_label.config(text=f"Iteration: {self._iteration}")
         self._draw_brain()
+        self._draw_brain_average()
 
     def _build_init_tab(self) -> None:
         p = self._init_tab
@@ -859,6 +951,27 @@ class App(tk.Tk):
             raise ValueError("Brain ID is not set.")
         safe_id = _runtime_safe_id(self._brain_id)
         return RUNTIME_DIR / f"{safe_id}_neurons", RUNTIME_DIR / f"{safe_id}_connectome"
+
+    def _default_video_path(self) -> Path:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        raw_id = self._brain_id or "current"
+        try:
+            safe_id = _runtime_safe_id(raw_id)
+        except ValueError:
+            safe_id = "current"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return RUNTIME_DIR / f"{safe_id}_{timestamp}.mp4"
+
+    def _resolve_video_output_path(self) -> Path:
+        raw_path = str(self._vars["video_file"].get()).strip()
+        path = Path(raw_path) if raw_path else self._default_video_path()
+        if not path.is_absolute() and path.parent == Path("."):
+            path = RUNTIME_DIR / path
+        if not path.suffix:
+            path = path.with_suffix(".mp4")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._vars["video_file"].set(str(path))
+        return path
 
     def _create_logic_history_path(self) -> Path:
         if self._brain_id is None:
@@ -1543,10 +1656,22 @@ class App(tk.Tk):
             "display": {
                 "show_seq_lines": bool(self._vars["show_seq_lines"].get()),
                 "circle_radius": self._circle_radius,
+                "summary_show_active": bool(self._vars["summary_show_active"].get()),
+                "summary_show_inputs": bool(self._vars["summary_show_inputs"].get()),
+                "summary_show_ces_pos": bool(self._vars["summary_show_ces_pos"].get()),
+                "summary_show_ces_neg": bool(self._vars["summary_show_ces_neg"].get()),
+                "video_summary_on_map": bool(self._vars["video_summary_on_map"].get()),
             },
             "runtime": {
                 key: self._vars[key].get()
-                for key in ("tick_ms", "max_iter", "seq_window")
+                for key in (
+                    "tick_ms",
+                    "max_iter",
+                    "seq_window",
+                    "avg_activity_window",
+                    "summary_depth",
+                    "video_summary_height",
+                )
                 if key in self._vars
             },
         }
@@ -1558,18 +1683,21 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
         last_yaml = cfg.get("last_yaml")
+        loaded_yaml = False
         if last_yaml:
             path = Path(last_yaml)
             if path.exists():
-                self._load_brain_yaml(path, apply_visualization=False)
+                loaded_yaml = self._load_brain_yaml(path, apply_visualization=False, auto_initialize=False)
 
         visualization = _visualization_config(cfg)
         if visualization:
             self._apply_visualization_config(visualization)
-            return
+        else:
+            # Legacy app config shape used params for visualization controls.
+            self._apply_legacy_params_config(cfg.get("params", {}))
 
-        # Legacy app config shape used params for visualization controls.
-        self._apply_legacy_params_config(cfg.get("params", {}))
+        if loaded_yaml:
+            self._initialize_loaded_config("app config")
 
     def _load_config(self, path: Path) -> None:
         if not path.exists():
@@ -1654,6 +1782,7 @@ class App(tk.Tk):
         self._status_label.config(text="Default YAML loaded", foreground="gray")
         self._log("Loaded default brain YAML")
         self._validate_model_compatibility()
+        self._initialize_loaded_config("default YAML")
 
     def _validate_brain_yaml_text(self, text: str) -> dict:
         data = _parse_yaml_text(text)
@@ -1859,7 +1988,13 @@ class App(tk.Tk):
         if p:
             self._load_brain_yaml(Path(p))
 
-    def _load_brain_yaml(self, path: Path, *, apply_visualization: bool = True) -> None:
+    def _load_brain_yaml(
+        self,
+        path: Path,
+        *,
+        apply_visualization: bool = True,
+        auto_initialize: bool = True,
+    ) -> bool:
         try:
             text = path.read_text(encoding="utf-8")
             data = _parse_yaml_text(text)
@@ -1872,7 +2007,7 @@ class App(tk.Tk):
         except (OSError, ValueError) as exc:
             messagebox.showerror("Load YAML", f"Could not load YAML:\n{exc}")
             self._log(f"Brain YAML load failed ({path}): {exc}")
-            return
+            return False
         self._brain_yaml_path = path
         self._set_brain_yaml_text(
             _strip_top_level_sections(text, ("visualization", "display", "runtime"))
@@ -1885,6 +2020,9 @@ class App(tk.Tk):
         self._save_config(CONFIG_PATH)
         self._log(f"Loaded brain YAML {path}")
         self._validate_model_compatibility()
+        if auto_initialize:
+            self._initialize_loaded_config(str(path))
+        return True
 
     def _save_brain_yaml(self) -> None:
         if self._brain_yaml_path is None:
@@ -1950,6 +2088,7 @@ class App(tk.Tk):
         self._world_status_label.config(text=f"Default YAML loaded ({module.__name__})", foreground="gray")
         self._log(f"Loaded default world YAML ({module.__name__})")
         self._validate_model_compatibility()
+        self._initialize_loaded_config(f"default world YAML ({module.__name__})")
         self._draw_world()
 
     def _load_world_yaml_dialog(self) -> None:
@@ -1976,6 +2115,7 @@ class App(tk.Tk):
         self._save_config(CONFIG_PATH)
         self._log(f"Loaded world YAML {path}")
         self._validate_model_compatibility()
+        self._initialize_loaded_config(str(path))
 
     def _save_world_yaml(self) -> None:
         if self._world_yaml_path is None:
@@ -2017,8 +2157,25 @@ class App(tk.Tk):
                 self._circle_radius = max(0.5, float(display["circle_radius"]))
             except (TypeError, ValueError):
                 pass
+        if isinstance(display, dict):
+            for key in (
+                "summary_show_active",
+                "summary_show_inputs",
+                "summary_show_ces_pos",
+                "summary_show_ces_neg",
+                "video_summary_on_map",
+            ):
+                if key in display and key in self._vars:
+                    self._vars[key].set(bool(display[key]))
         if isinstance(runtime, dict):
-            for key in ("tick_ms", "max_iter", "seq_window"):
+            for key in (
+                "tick_ms",
+                "max_iter",
+                "seq_window",
+                "avg_activity_window",
+                "summary_depth",
+                "video_summary_height",
+            ):
                 if key in runtime and key in self._vars:
                     self._vars[key].set(runtime[key])
 
@@ -2090,13 +2247,16 @@ class App(tk.Tk):
         if self._brain is None:
             c.create_text(W // 2, H // 2, text="Brain visualization", fill="#3d4451", font=("Helvetica", 14))
             self._draw_brain_status_overlay(W, H)
+            self._draw_brain_average()
             return
 
         # View transform: brain [0,1]² → canvas pixels
+        strip_h = self._brain_map_summary_strip_height(H)
+        map_h = max(2, H - strip_h)
         CW = W - 2 * _MARGIN
-        CH = H - 2 * _MARGIN
+        CH = max(1.0, map_h - 2 * _MARGIN)
         vx, vy, vs = self._view_x, self._view_y, self._view_scale
-        half_w, half_h = W / 2, H / 2
+        half_w, half_h = W / 2, map_h / 2
 
         def tc(px: float, py: float) -> tuple[float, float]:
             return half_w + (px - vx) * CW * vs, half_h + (py - vy) * CH * vs
@@ -2110,6 +2270,20 @@ class App(tk.Tk):
 
         # Input / output links for the selected neuron (drawn behind neurons)
         sel = self._cas_neuron_idx
+        neurons = self._brain.substrate.brain
+
+        def source_link_color(source_idx: int) -> str:
+            if source_idx < 0 or source_idx >= len(neurons):
+                return "#4b5563"
+            source = neurons[source_idx]
+            if not source.active:
+                return "#4b5563"
+            if source.eq > 0.0:
+                return "#22cc55"
+            if source.eq < 0.0:
+                return "#cc2222"
+            return "#9ca3af"
+
         if sel is not None and sel < len(self._positions):
             in_links  = self._adj_in.get(sel, [])
             out_links = self._adj_out.get(sel, [])
@@ -2119,21 +2293,20 @@ class App(tk.Tk):
             for src, w in in_links:
                 ox, oy = tc(*self._positions[src])
                 c.create_line(ox, oy, sx, sy, arrow=tk.LAST, arrowshape=(8, 10, 4),
-                              fill="#2255cc", width=max(1.0, abs(w) / max_w * 5))
+                              fill=source_link_color(src), width=max(1.0, abs(w) / max_w * 5))
             for dst, w in out_links:
                 dx, dy = tc(*self._positions[dst])
                 c.create_line(sx, sy, dx, dy, arrow=tk.LAST, arrowshape=(8, 10, 4),
-                              fill="#cc5522", width=max(1.0, abs(w) / max_w * 5))
+                              fill=source_link_color(sel), width=max(1.0, abs(w) / max_w * 5))
 
         # O(1) window-position lookup; brightness 10 % (oldest) → 100 % (newest)
         win_pos = {idx: wpos for wpos, idx in enumerate(self._seq_window)}
         M = len(self._seq_window)
 
-        neurons = self._brain.substrate.brain
         for i, ((px, py), neuron) in enumerate(zip(self._positions, neurons)):
             cx, cy = tc(px, py)
             # off-screen culling
-            if cx < -50 or cx > W + 50 or cy < -50 or cy > H + 50:
+            if cx < -50 or cx > W + 50 or cy < -50 or cy > map_h + 50:
                 continue
 
             wpos = win_pos.get(i)
@@ -2172,17 +2345,79 @@ class App(tk.Tk):
         hi = self._highlight_neuron_idx
         if hi is not None and hi < len(self._positions):
             hx, hy = tc(*self._positions[hi])
-            if -60 < hx < W + 60 and -60 < hy < H + 60:
+            if -60 < hx < W + 60 and -60 < hy < map_h + 60:
                 hr = min(max(self._circle_radius + 5, 8), 42.0)
                 c.create_oval(hx - hr, hy - hr, hx + hr, hy + hr,
                               fill="", outline="#f59e0b", width=3)
         if sel is not None and sel < len(self._positions):
             sx, sy = tc(*self._positions[sel])
-            if -60 < sx < W + 60 and -60 < sy < H + 60:
+            if -60 < sx < W + 60 and -60 < sy < map_h + 60:
                 hr = min(max(self._circle_radius + 3, 6), 40.0)
                 c.create_oval(sx - hr, sy - hr, sx + hr, sy + hr,
                               fill="", outline="#ffffff", width=2)
-        self._draw_brain_status_overlay(W, H)
+        self._draw_brain_status_overlay(W, map_h)
+        self._draw_activity_summary_on_brain_map(c, W, H)
+        self._draw_brain_average()
+
+    def _draw_brain_average(self, event=None) -> None:
+        if not hasattr(self, "_brain_average_canvas"):
+            return
+        c = self._brain_average_canvas
+        W, H = c.winfo_width(), c.winfo_height()
+        if W <= 1 or H <= 1:
+            return
+        c.delete("all")
+        if self._brain is None:
+            c.create_text(W // 2, H // 2, text="Brain average activity", fill="#3d4451", font=("Helvetica", 14))
+            return
+
+        try:
+            window = max(1, int(self._vars["avg_activity_window"].get()))
+        except (tk.TclError, ValueError):
+            window = 100
+            self._vars["avg_activity_window"].set(window)
+
+        CW = W - 2 * _MARGIN
+        CH = H - 2 * _MARGIN
+        vx, vy, vs = self._view_x, self._view_y, self._view_scale
+        half_w, half_h = W / 2, H / 2
+
+        def tc(px: float, py: float) -> tuple[float, float]:
+            return half_w + (px - vx) * CW * vs, half_h + (py - vy) * CH * vs
+
+        neurons = self._brain.substrate.brain
+        for (px, py), neuron in zip(self._positions, neurons):
+            cx, cy = tc(px, py)
+            if cx < -50 or cx > W + 50 or cy < -50 or cy > H + 50:
+                continue
+            history = neuron.history[-window:]
+            average = (
+                sum(1 for entry in history if bool(entry.get("active", False))) / len(history)
+                if history
+                else 0.0
+            )
+            if average <= 0.0:
+                color = "#2a2a2a"
+            elif neuron.eq > 0.0:
+                brightness = int(32 + average * 223)
+                color = f"#00{brightness:02x}40"
+            elif neuron.eq < 0.0:
+                brightness = int(32 + average * 223)
+                color = f"#{brightness:02x}2020"
+            else:
+                brightness = int(32 + average * 223)
+                color = f"#{brightness:02x}{brightness:02x}{brightness:02x}"
+            r = self._circle_radius
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline=color, width=1)
+
+        c.create_text(
+            12,
+            10,
+            text=f"Average activity over last {window} iterations",
+            fill="#9fb8c8",
+            font=("Courier", 10, "bold"),
+            anchor="nw",
+        )
 
     def _draw_brain_status_overlay(self, width: int, height: int) -> None:
         active = 0
@@ -2505,13 +2740,22 @@ class App(tk.Tk):
 
     # ── Simulation callbacks (stubs) ──────────────────────────────────────────
 
-    def _on_initialize_all(self) -> None:
-        if not self._on_validate_config():
+    def _initialize_loaded_config(self, source: str) -> None:
+        self._log(f"Auto-initializing loaded config ({source})")
+        if not self._on_initialize():
+            self._log(f"Auto-initialization stopped after brain init failure ({source})")
             return
-        self._on_initialize()
-        self._on_world_initialize()
+        if not self._on_world_initialize():
+            self._log(f"Auto-initialization stopped after world init failure ({source})")
 
-    def _on_world_initialize(self) -> None:
+    def _on_initialize_all(self) -> bool:
+        if not self._on_validate_config():
+            return False
+        if not self._on_initialize():
+            return False
+        return self._on_world_initialize()
+
+    def _on_world_initialize(self) -> bool:
         try:
             text = self._world_yaml_text()
             data = self._validate_world_yaml_text(text)
@@ -2524,7 +2768,7 @@ class App(tk.Tk):
             self._world_status_label.config(text="Invalid YAML", foreground="red")
             self._log(f"World initialization failed: {exc}")
             self._draw_world()
-            return
+            return False
         self._world_initialized = True
         self._world_first_process_pending = True
         self._select_world_module(module)
@@ -2532,8 +2776,9 @@ class App(tk.Tk):
         self._log(f"World initialized ({module.__name__})")
         self._validate_model_compatibility()
         self._draw_world()
+        return True
 
-    def _on_initialize(self) -> None:
+    def _on_initialize(self) -> bool:
         try:
             cfg = self._read_brain_yaml()
             brain_id = _brain_id_from_config(cfg)
@@ -2568,7 +2813,7 @@ class App(tk.Tk):
             messagebox.showerror("Init", f"Invalid brain YAML:\n{exc}")
             self._status_label.config(text="Invalid YAML", foreground="red")
             self._log(f"Brain initialization failed: {exc}")
-            return
+            return False
 
         try:
             positions = self._assembly_positions(cfg, target_n)
@@ -2599,7 +2844,7 @@ class App(tk.Tk):
             messagebox.showerror("Init", f"Invalid brain YAML:\n{exc}")
             self._status_label.config(text="Invalid YAML", foreground="red")
             self._log(f"Brain initialization failed: {exc}")
-            return
+            return False
 
         if input_indices:
             brain.substrate.connectome = [
@@ -2617,6 +2862,9 @@ class App(tk.Tk):
         self._positions = positions
         self._brain = brain
         self._brain_id = brain_id
+        current_video_file = str(self._vars["video_file"].get()).strip()
+        if not current_video_file or Path(current_video_file).stem.startswith("current_"):
+            self._vars["video_file"].set(str(self._default_video_path()))
         self._in_counts = in_counts
         self._out_counts = out_counts
         self._input_indices = input_indices
@@ -2634,6 +2882,10 @@ class App(tk.Tk):
         self._seq_cursor = 0
         self._update_seq_label()
         self._act_history.clear()
+        self._active_input_history.clear()
+        self._ces_pos_history.clear()
+        self._ces_neg_history.clear()
+        self._last_active_input_count = 0
         self._cas_charge.clear()
         self._cas_active.clear()
         self._cas_signal.clear()
@@ -2656,6 +2908,7 @@ class App(tk.Tk):
         self._refresh_inputs_editor()
         self._draw_cas()
         self._draw_act_count()
+        return True
 
     def _initialize_inputs(
         self,
@@ -3078,11 +3331,16 @@ class App(tk.Tk):
                 previous_signal = list(neuron.signal)
                 previous_charge = neuron.charge
                 active = idx in active_indices
+                neuron.resize_layers(self._brain.number_of_layers)
                 neuron.charge = neuron.charge_max if active else 0.0
-                neuron.signal[0] = translation.value if active else 0.0
-                neuron.active = active
                 if active:
+                    threshold = neuron.trigger[0] + neuron.trigger_flex + neuron.eq
+                    neuron.signal[0] = max(translation.value, neuron.charge, threshold + 1e-9, 1.0)
+                    neuron.active = True
                     neuron.drop_charge_next_cycle = False
+                else:
+                    neuron.status = [False] * neuron.number_of_layers
+                    neuron.signal[0] = 0.0
                 detail = (
                     f"idx={idx} name={neuron.name!r} "
                     f"previous_active={previous_active} "
@@ -3318,9 +3576,331 @@ class App(tk.Tk):
                 return parsed
         return None
 
+    def _start_video_recording(self) -> None:
+        if self._video_recording:
+            return
+        try:
+            fps = max(1, int(self._vars["video_fps"].get()))
+        except (tk.TclError, ValueError):
+            fps = 30
+            self._vars["video_fps"].set(fps)
+        output_path = self._resolve_video_output_path()
+        frame_root = RUNTIME_DIR / f"{output_path.stem}_frames"
+        if frame_root.exists():
+            shutil.rmtree(frame_root)
+        frame_root.mkdir(parents=True, exist_ok=True)
+        self._video_recording = True
+        self._video_frame_dir = frame_root
+        self._video_output_path = output_path
+        self._video_frame_count = 0
+        self._log(f"Video recording started: {output_path} at {fps} FPS")
+
+    def _record_video_frame(self) -> None:
+        if not self._video_recording or self._video_frame_dir is None or self._brain is None:
+            return
+        try:
+            self.update_idletasks()
+            width = max(2, int(self._brain_canvas.winfo_width()))
+            height = max(2, int(self._brain_canvas.winfo_height()))
+            width -= width % 2
+            height -= height % 2
+            frame_path = self._video_frame_dir / f"frame_{self._video_frame_count:06d}.ppm"
+            self._write_brain_map_ppm(frame_path, width, height)
+            self._video_frame_count += 1
+        except (OSError, ValueError, tk.TclError) as exc:
+            self._log(f"Video frame capture failed: {exc}")
+
+    def _finish_video_recording(self) -> None:
+        frame_dir = self._video_frame_dir
+        output_path = self._video_output_path
+        frame_count = self._video_frame_count
+        self._video_recording = False
+        self._video_frame_dir = None
+        self._video_output_path = None
+        self._video_frame_count = 0
+        if frame_dir is None or output_path is None:
+            return
+        if frame_count == 0:
+            self._log("Video recording stopped: no frames captured")
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            return
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            self._log(f"Video recording stopped: ffmpeg not found; frames kept in {frame_dir}")
+            return
+        try:
+            fps = max(1, int(self._vars["video_fps"].get()))
+        except (tk.TclError, ValueError):
+            fps = 30
+        command = [
+            ffmpeg,
+            "-y",
+            "-framerate",
+            str(fps),
+            "-i",
+            str(frame_dir / "frame_%06d.ppm"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
+            self._log(f"Video assembly failed: {detail}; frames kept in {frame_dir}")
+            return
+        shutil.rmtree(frame_dir, ignore_errors=True)
+        self._log(f"Video saved {output_path} ({frame_count} frames)")
+
+    def _write_brain_map_ppm(self, path: Path, width: int, height: int) -> None:
+        if self._write_canvas_snapshot_ppm(path, width, height):
+            return
+
+        bg = (0x0d, 0x11, 0x17)
+        pixels = bytearray(bg * (width * height))
+        if self._brain is not None:
+            neurons = self._brain.substrate.brain
+            strip_h = self._brain_map_summary_strip_height(height)
+            map_h = max(2, height - strip_h)
+            cw = width - 2 * _MARGIN
+            ch = max(1.0, map_h - 2 * _MARGIN)
+            half_w, half_h = width / 2, map_h / 2
+
+            def tc(px: float, py: float) -> tuple[float, float]:
+                return (
+                    half_w + (px - self._view_x) * cw * self._view_scale,
+                    half_h + (py - self._view_y) * ch * self._view_scale,
+                )
+
+            radius = max(1, int(round(self._circle_radius)))
+            for idx, ((px, py), neuron) in enumerate(zip(self._positions, neurons)):
+                cx, cy = tc(px, py)
+                if cx < -radius or cx >= width + radius or cy < -radius or cy >= map_h + radius:
+                    continue
+                if idx in self._input_indices:
+                    color = (0x74, 0xc7, 0xff) if neuron.active else (0x0b, 0x24, 0x47)
+                    fill = neuron.active
+                elif neuron.active:
+                    color = (0x22, 0xcc, 0x55) if neuron.eq >= 0.0 else (0xcc, 0x22, 0x22)
+                    fill = True
+                else:
+                    color = (0x3a, 0x3a, 0x3a)
+                    fill = False
+                self._draw_ppm_circle(pixels, width, height, int(round(cx)), int(round(cy)), radius, color, fill)
+        self._draw_ppm_activity_summary_overlay(pixels, width, height)
+        with path.open("wb") as file:
+            file.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
+            file.write(pixels)
+
+    def _write_canvas_snapshot_ppm(self, path: Path, width: int, height: int) -> bool:
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except ImportError:
+            return False
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hwnd = int(self._brain_canvas.winfo_id())
+        src_dc = user32.GetDC(hwnd)
+        if not src_dc:
+            return False
+        mem_dc = gdi32.CreateCompatibleDC(src_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(src_dc, width, height)
+        if not mem_dc or not bitmap:
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if mem_dc:
+                gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(hwnd, src_dc)
+            return False
+
+        old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
+        success = False
+        try:
+            srccopy = 0x00CC0020
+            if not gdi32.BitBlt(mem_dc, 0, 0, width, height, src_dc, 0, 0, srccopy):
+                return False
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD),
+                    ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            class BITMAPINFO(ctypes.Structure):
+                _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 1)]
+
+            row_stride = ((width * 3 + 3) // 4) * 4
+            image_size = row_stride * height
+            buffer = (ctypes.c_ubyte * image_size)()
+            info = BITMAPINFO()
+            info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            info.bmiHeader.biWidth = width
+            info.bmiHeader.biHeight = -height
+            info.bmiHeader.biPlanes = 1
+            info.bmiHeader.biBitCount = 24
+            info.bmiHeader.biCompression = 0
+            info.bmiHeader.biSizeImage = image_size
+            scan_lines = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(info), 0)
+            if scan_lines != height:
+                return False
+
+            with path.open("wb") as file:
+                file.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
+                for y in range(height):
+                    row_start = y * row_stride
+                    for x in range(width):
+                        offset = row_start + x * 3
+                        b, g, r = buffer[offset], buffer[offset + 1], buffer[offset + 2]
+                        file.write(bytes((r, g, b)))
+            success = True
+            return True
+        finally:
+            gdi32.SelectObject(mem_dc, old_bitmap)
+            gdi32.DeleteObject(bitmap)
+            gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(hwnd, src_dc)
+            if not success:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+    def _draw_ppm_circle(
+        self,
+        pixels: bytearray,
+        width: int,
+        height: int,
+        cx: int,
+        cy: int,
+        radius: int,
+        color: tuple[int, int, int],
+        fill: bool,
+    ) -> None:
+        radius2 = radius * radius
+        inner2 = max(0, (radius - 1) * (radius - 1))
+        for y in range(max(0, cy - radius), min(height, cy + radius + 1)):
+            dy = y - cy
+            for x in range(max(0, cx - radius), min(width, cx + radius + 1)):
+                dx = x - cx
+                d2 = dx * dx + dy * dy
+                if d2 > radius2 or (not fill and d2 < inner2):
+                    continue
+                offset = (y * width + x) * 3
+                pixels[offset:offset + 3] = bytes(color)
+
+    def _draw_ppm_activity_summary_overlay(self, pixels: bytearray, width: int, height: int) -> None:
+        if not bool(self._vars["video_summary_on_map"].get()):
+            return
+        overlay_h = self._brain_map_summary_strip_height(height)
+        if overlay_h <= 0:
+            return
+        y0 = height - overlay_h
+        bg = (0x0d, 0x11, 0x17)
+        axis = (0x2a, 0x2a, 0x2a)
+        for y in range(y0, height):
+            for x in range(width):
+                self._set_ppm_pixel(pixels, width, height, x, y, bg)
+
+        series = self._activity_summary_series(self._summary_depth_value())
+        values = [float(value) for data, _, _label in series for value in data]
+        if not series or not values:
+            return
+        vmin = min(values)
+        vmax = max(values)
+        if vmin == vmax:
+            vmin -= 0.5
+            vmax += 0.5
+
+        left = 42
+        right = width - 6
+        top = y0 + 4
+        bottom = height - 4
+        if right <= left or bottom <= top:
+            return
+        self._draw_ppm_line(pixels, width, height, left, top, left, bottom, axis)
+        self._draw_ppm_line(pixels, width, height, left, bottom, right, bottom, axis)
+        if vmin < 0.0 < vmax:
+            zero_y = bottom - int(round((0.0 - vmin) / (vmax - vmin) * (bottom - top)))
+            self._draw_ppm_line(pixels, width, height, left, zero_y, right, zero_y, (0x33, 0x41, 0x55))
+
+        for data, color_hex, _label in series:
+            vals = [float(value) for value in data]
+            if len(vals) < 2:
+                continue
+            color = self._hex_to_rgb(color_hex)
+            last_x = left
+            last_y = bottom - int(round((vals[0] - vmin) / (vmax - vmin) * (bottom - top)))
+            for i, value in enumerate(vals[1:], start=1):
+                x = left + int(round(i * (right - left) / (len(vals) - 1)))
+                y = bottom - int(round((value - vmin) / (vmax - vmin) * (bottom - top)))
+                self._draw_ppm_line(pixels, width, height, last_x, last_y, x, y, color)
+                last_x, last_y = x, y
+
+    def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
+        text = color.lstrip("#")
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+
+    def _set_ppm_pixel(
+        self,
+        pixels: bytearray,
+        width: int,
+        height: int,
+        x: int,
+        y: int,
+        color: tuple[int, int, int],
+    ) -> None:
+        if x < 0 or x >= width or y < 0 or y >= height:
+            return
+        offset = (y * width + x) * 3
+        pixels[offset:offset + 3] = bytes(color)
+
+    def _draw_ppm_line(
+        self,
+        pixels: bytearray,
+        width: int,
+        height: int,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        color: tuple[int, int, int],
+    ) -> None:
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        while True:
+            self._set_ppm_pixel(pixels, width, height, x, y, color)
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+
     def _on_start(self) -> None:
         if self._running:
             return
+        if bool(self._vars["record_video"].get()):
+            self._start_video_recording()
         self._running = True
         self._log("Simulation started")
         self._tick()
@@ -3333,6 +3913,8 @@ class App(tk.Tk):
             self._tick_id = None
         if was_running:
             self._log("Simulation paused")
+        if self._video_recording:
+            self._finish_video_recording()
 
     def _on_step(self) -> None:
         if self._run_simulation_cycle():
@@ -3345,6 +3927,9 @@ class App(tk.Tk):
 
         # 1. Read values from physical model and update io table and input value vars
         world_outputs = self._read_physical_model_values()
+        light_val = math.sin(self._iteration * 0.1) * 55 + 55
+        hunger_val = (math.cos(self._iteration * 0.05) + 1) * 50
+        world_outputs = {'velocity': 0.5, 'hunger': hunger_val, 'light': light_val }
 
         # 2. Apply input values to neurons (body translation and logging)
         self._apply_physical_outputs_to_input_neurons(world_outputs)
@@ -3367,6 +3952,7 @@ class App(tk.Tk):
         # 8. Save detailed logic history
         self._append_logic_history()
         self._update_iteration_display()
+        self._record_video_frame()
         if self._world_initialized:
             self._draw_world()
         return True
@@ -3436,6 +4022,12 @@ class App(tk.Tk):
         if self._brain is None:
             return
         self._apply_runtime_active_overrides()
+        neurons = self._brain.substrate.brain
+        self._last_active_input_count = sum(
+            1
+            for idx in self._input_indices
+            if idx < len(neurons) and neurons[idx].active
+        )
         self._update_last_active_input_indices()
         selected_idx = self._cas_neuron_idx
         if selected_idx is None or selected_idx >= len(self._brain.substrate.brain):
@@ -3747,7 +4339,12 @@ class App(tk.Tk):
 
     def _record_history(self) -> None:
         neurons = self._brain.substrate.brain
-        self._act_history.append(sum(1 for n in neurons if n.active))
+        active_neurons = [n for n in neurons if n.active]
+        active_count = len(active_neurons)
+        self._act_history.append((active_count / len(neurons) * 100.0) if neurons else 0.0)
+        self._active_input_history.append(float(self._last_active_input_count))
+        self._ces_pos_history.append(sum(n.eq for n in active_neurons if n.eq > 0.0))
+        self._ces_neg_history.append(sum(n.eq for n in active_neurons if n.eq < 0.0))
         if self._cas_neuron_idx is not None and self._cas_neuron_idx < len(neurons):
             n = neurons[self._cas_neuron_idx]
             self._cas_charge.append(n.charge)
@@ -3812,6 +4409,103 @@ class App(tk.Tk):
             pts.append(ay1 - (v - vmin) / (vmax - vmin) * ph)
         c.create_line(*pts, fill=color, width=1)
 
+    def _summary_depth_value(self) -> int:
+        try:
+            return max(1, int(self._vars["summary_depth"].get()))
+        except (tk.TclError, ValueError):
+            depth = 1000
+            self._vars["summary_depth"].set(depth)
+            return depth
+
+    def _video_summary_height_value(self) -> int:
+        try:
+            return max(10, int(self._vars["video_summary_height"].get()))
+        except (tk.TclError, ValueError):
+            height = 40
+            self._vars["video_summary_height"].set(height)
+            return height
+
+    def _brain_map_summary_strip_height(self, canvas_height: int) -> int:
+        if not bool(self._vars["video_summary_on_map"].get()):
+            return 0
+        return min(max(10, self._video_summary_height_value()), max(0, canvas_height - 4))
+
+    def _activity_summary_series(self, depth: int) -> list[tuple[list[float], str, str]]:
+        series: list[tuple[list[float], str, str]] = []
+        if self._vars["summary_show_active"].get():
+            series.append(([float(v) for v in list(self._act_history)[-depth:]], "#9ca3af", "Active count %"))
+        if self._vars["summary_show_inputs"].get():
+            series.append(([float(v) for v in list(self._active_input_history)[-depth:]], "#74c7ff", "Active input neurons"))
+        if self._vars["summary_show_ces_pos"].get():
+            series.append(([float(v) for v in list(self._ces_pos_history)[-depth:]], "#22cc55", "CES pos"))
+        if self._vars["summary_show_ces_neg"].get():
+            series.append(([float(v) for v in list(self._ces_neg_history)[-depth:]], "#ef4444", "CES neg"))
+        return series
+
+    def _draw_activity_summary_on_brain_map(self, c: tk.Canvas, width: int, height: int) -> None:
+        if not bool(self._vars["video_summary_on_map"].get()):
+            return
+        overlay_h = self._brain_map_summary_strip_height(height)
+        if overlay_h <= 0:
+            return
+        y0 = height - overlay_h
+        c.create_rectangle(0, y0, width, height, fill="#0d1117", outline="#2a2a2a")
+        self._plot_summary(c, self._activity_summary_series(self._summary_depth_value()), 0, y0, width, overlay_h)
+
+    def _plot_summary(
+        self,
+        c: tk.Canvas,
+        series: list[tuple[deque | list, str, str]],
+        x0: int, y0: int, w: int, h: int,
+    ) -> None:
+        ML, MR, MT, MB = 42, 6, 18, 12
+        ax = x0 + ML
+        ay0 = y0 + MT
+        ay1 = y0 + h - MB
+        pw = max(x0 + w - MR - ax, 1)
+        ph = max(ay1 - ay0, 1)
+
+        c.create_line(ax, ay0, ax, ay1, fill="#2a2a2a", width=1)
+        c.create_line(ax, ay1, ax + pw, ay1, fill="#2a2a2a", width=1)
+
+        if not series:
+            c.create_text(ax + 4, y0 + 2, text="No signals selected", fill="#555", font=("Courier", 8), anchor="nw")
+            return
+
+        values = [float(value) for data, _, _ in series for value in data]
+        vmin = min(values) if values else 0.0
+        vmax = max(values) if values else 1.0
+        if vmin == vmax:
+            vmin -= 0.5
+            vmax += 0.5
+
+        for frac, val in ((0.0, vmax), (0.5, (vmin + vmax) / 2), (1.0, vmin)):
+            ty = ay0 + frac * ph
+            c.create_line(ax - 3, ty, ax, ty, fill="#444", width=1)
+            c.create_text(ax - 4, ty, text=f"{val:.3g}", fill="#555",
+                          font=("Courier", 7), anchor="e")
+            if 0.0 < frac < 1.0:
+                c.create_line(ax, ty, ax + pw, ty, fill="#1c1c1c", width=1, dash=(2, 4))
+
+        if vmin < 0.0 < vmax:
+            zero_y = ay1 - (0.0 - vmin) / (vmax - vmin) * ph
+            c.create_line(ax, zero_y, ax + pw, zero_y, fill="#334155", width=1)
+
+        legend_x = ax + 4
+        for _data, color, label in series:
+            c.create_text(legend_x, y0 + 2, text=label, fill=color, font=("Courier", 8), anchor="nw")
+            legend_x += max(90, len(label) * 8)
+
+        for data, color, _label in series:
+            vals = [float(value) for value in data]
+            if len(vals) < 2:
+                continue
+            pts = []
+            for i, value in enumerate(vals):
+                pts.append(ax + i * pw / (len(vals) - 1))
+                pts.append(ay1 - (value - vmin) / (vmax - vmin) * ph)
+            c.create_line(*pts, fill=color, width=1)
+
     def _draw_cas(self, event=None) -> None:
         c = self._cas_canvas
         W, H = c.winfo_width(), c.winfo_height()
@@ -3839,9 +4533,7 @@ class App(tk.Tk):
         if W <= 1 or H <= 1:
             return
         c.delete("all")
-        n_total = len(self._positions)
-        self._plot(c, self._act_history, "#22cc55", "Active neurons",
-                   0, 0, W, H, y_min=0, y_max=max(n_total, 1))
+        self._plot_summary(c, self._activity_summary_series(self._summary_depth_value()), 0, 0, W, H)
 
     def _on_close(self) -> None:
         self._log("Application closing")
