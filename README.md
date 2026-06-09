@@ -125,8 +125,14 @@ The plugin runs a WebSocket server on port 8765 in a daemon thread. Vue sends se
 # Terminal 1 — charly6
 source .venv/bin/activate
 python run.py
-# In UI: Load YAML → brain.yaml → Init → Run
+```
 
+In the charly6 UI:
+1. Click **Load YAML** → select `brain.yaml`
+2. Click **Init**
+3. Click **Run**
+
+```bash
 # Terminal 2 — Vue 2D world (separate repo)
 cd CharlieWorm
 npm run dev
