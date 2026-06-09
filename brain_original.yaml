@@ -1,0 +1,106 @@
+# --------------------------------------------------- Brain configuration
+ID: charly_6_1
+brain:
+  neurons: 2000
+  head_size: 0
+  connections_per_neuron: 10
+  max_synapse_length: 0.3
+  weight_min: 0.0
+  weight_max: 1.0
+  total_input: 1000.0
+  seed: 42
+  NUMBER_OF_LAYERS: 1
+  HISTORY_DEPTH: 32
+  CHARGE_MAX: 100.0
+  Initialization:
+    default_charge: charge_max
+    default_recharge: 0.2
+    default_eq_min: -0.1
+    default_eq_max: 0.1
+
+# --------------------------------------------------- Topology
+# Available foldings:
+# - phc: pseudo-Hilbert curve, fills the configured space from the first coordinate outward.
+# - spiral: hexagonal spiral, starts at the first coordinate and grows ring by ring.
+assembly:
+  - method: spiral
+    count: LAST
+    params: default
+
+# --------------------------------------------------- Inputs
+inputs:
+  - hunger:
+    center: 396
+    radius: 5
+    number: 50
+    eq_min: 0
+    eq_max: -100
+  - light:
+    center: 1000
+    radius: 10
+    number: 30
+    eq_min: 0
+    eq_max: -100
+
+# --------------------------------------------------- Outputs
+outputs:
+  - left_motor: [0, 1, 2, 3, 4]
+  - right_motor: [5, 6, 7, 8, 9]
+
+# --------------------------------------------------- Body
+# Translates physical world outputs into counts of brain input neurons to activate.
+# formula: linear, inverse_linear, or threshold.
+# count = round(clamp((value - min) / (max - min), 0..1) * input_neuron_count)
+body:
+  mappings:
+    - target: hunger
+      source: hunger
+      formula: linear
+      min: 0.0
+      max: 100.0
+      clamp: true
+      rounding: round
+    - target: light
+      source: light
+      formula: linear
+      min: 0.0
+      max: 10.0
+      clamp: true
+      rounding: round
+
+# --------------------------------------------------- Physical world
+physical_world:
+  world:
+    base: worlds/linear.py
+    dt: 0.1
+    seed: 42
+    input_validation: strict
+    max_steps: null
+    dimensions: 2
+    bounds:
+      x: [-10.0, 10.0]
+      y: [0.0, 1.0]
+    drag: 0.05
+  objects:
+    - name: agent
+      shape: triangle
+      mass: 1.0
+      radius: 0.5
+      position: [0.0]
+      velocity: [0.0]
+      restitution: 0.2
+      stomach_content: 10.0
+    - name: light
+      x: 5.0
+      brightness: 10.0
+  inputs:
+    - name: left_motor
+      min: 0.0
+      max: 10.0
+    - name: right_motor
+      min: 0.0
+      max: 10.0
+  outputs:
+    velocity: velocity
+    hunger: hunger
+    light: lightness

@@ -460,7 +460,7 @@ class App(tk.Tk):
         self._build_menu()
         self._build_layout()
         self._log(f"Opened log {self._log_path}")
-        self.attributes('-zoomed', True)
+        self.geometry('1400x850+0+0')
         self._load_config(CONFIG_PATH)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -744,6 +744,7 @@ class App(tk.Tk):
             values=list(self._world_plugins),
             state="readonly",
             width=18,
+            height=2,
         ).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Default World", command=self._load_default_world_yaml).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Validate", command=self._on_validate_config).pack(side=tk.RIGHT, padx=4)
@@ -793,6 +794,7 @@ class App(tk.Tk):
             values=list(self._world_plugins),
             state="readonly",
             width=18,
+            height=2,
         ).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Load YAML", command=self._load_world_yaml_dialog).pack(side=tk.LEFT, padx=4)
         ttk.Button(act, text="Save YAML", command=self._save_world_yaml).pack(side=tk.LEFT, padx=4)
@@ -3927,9 +3929,6 @@ class App(tk.Tk):
 
         # 1. Read values from physical model and update io table and input value vars
         world_outputs = self._read_physical_model_values()
-        light_val = math.sin(self._iteration * 0.1) * 55 + 55
-        hunger_val = (math.cos(self._iteration * 0.05) + 1) * 50
-        world_outputs = {'velocity': 0.5, 'hunger': hunger_val, 'light': light_val }
 
         # 2. Apply input values to neurons (body translation and logging)
         self._apply_physical_outputs_to_input_neurons(world_outputs)
