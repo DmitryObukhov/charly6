@@ -393,6 +393,8 @@ class App(tk.Tk):
         self._vars["video_file"] = tk.StringVar(value="")
         self._vars["video_summary_on_map"] = tk.BooleanVar(value=False)
         self._vars["video_summary_height"] = tk.IntVar(value=40)
+        self._vars["spectrogram_depth"] = tk.IntVar(value=64)
+        self._vars["spectrogram_on_map"] = tk.BooleanVar(value=False)
         self._vars["eq_outline_threshold_percent"] = tk.DoubleVar(value=0.1)
         self._brain: Brain | None = None
         self._brain_id: str | None = None
@@ -422,6 +424,7 @@ class App(tk.Tk):
         self._active_input_history: deque[float] = deque(maxlen=1000)
         self._ces_pos_history: deque[float] = deque(maxlen=1000)
         self._ces_neg_history: deque[float] = deque(maxlen=1000)
+        self._tes_history: deque[float] = deque(maxlen=1000)
         self._last_active_input_count: int = 0
         self._cas_neuron_idx: int | None = None
         self._highlight_neuron_idx: int | None = None
@@ -634,8 +637,8 @@ class App(tk.Tk):
             width=7,
         )
         self._summary_depth_entry.pack(side=tk.LEFT)
-        self._summary_depth_entry.bind("<Return>", lambda _event: self._draw_act_count())
-        self._summary_depth_entry.bind("<FocusOut>", lambda _event: self._draw_act_count())
+        self._summary_depth_entry.bind("<Return>", lambda _event: self._draw_synced_activity_views())
+        self._summary_depth_entry.bind("<FocusOut>", lambda _event: self._draw_synced_activity_views())
         ttk.Checkbutton(
             act_controls,
             text="On map",
@@ -654,6 +657,29 @@ class App(tk.Tk):
         self._act_canvas = tk.Canvas(act_tab, bg="#0d1117")
         self._act_canvas.pack(fill=tk.BOTH, expand=True)
         self._act_canvas.bind("<Configure>", self._draw_act_count)
+
+        spectrogram_tab = ttk.Frame(self._bottom_nb)
+        self._bottom_nb.add(spectrogram_tab, text=" TES Spectrogram ")
+        spectrogram_controls = ttk.Frame(spectrogram_tab)
+        spectrogram_controls.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
+        ttk.Label(spectrogram_controls, text="D").pack(side=tk.LEFT, padx=(0, 4))
+        self._spectrogram_depth_entry = ttk.Entry(
+            spectrogram_controls,
+            textvariable=self._vars["spectrogram_depth"],
+            width=7,
+        )
+        self._spectrogram_depth_entry.pack(side=tk.LEFT)
+        self._spectrogram_depth_entry.bind("<Return>", lambda _event: self._draw_spectrogram())
+        self._spectrogram_depth_entry.bind("<FocusOut>", lambda _event: self._draw_spectrogram())
+        ttk.Checkbutton(
+            spectrogram_controls,
+            text="On map",
+            variable=self._vars["spectrogram_on_map"],
+            command=self._draw_brain,
+        ).pack(side=tk.LEFT, padx=(10, 3))
+        self._spectrogram_canvas = tk.Canvas(spectrogram_tab, bg="#0d1117")
+        self._spectrogram_canvas.pack(fill=tk.BOTH, expand=True)
+        self._spectrogram_canvas.bind("<Configure>", self._draw_spectrogram)
 
         neuron_fields_tab = ttk.Frame(self._bottom_nb)
         self._bottom_nb.add(neuron_fields_tab, text=" Neuron fields ")
@@ -1677,6 +1703,7 @@ class App(tk.Tk):
                 "summary_show_ces_pos": bool(self._vars["summary_show_ces_pos"].get()),
                 "summary_show_ces_neg": bool(self._vars["summary_show_ces_neg"].get()),
                 "video_summary_on_map": bool(self._vars["video_summary_on_map"].get()),
+                "spectrogram_on_map": bool(self._vars["spectrogram_on_map"].get()),
             },
             "runtime": {
                 key: self._vars[key].get()
@@ -1687,6 +1714,7 @@ class App(tk.Tk):
                     "avg_activity_window",
                     "summary_depth",
                     "video_summary_height",
+                    "spectrogram_depth",
                 )
                 if key in self._vars
             },
@@ -2187,6 +2215,7 @@ class App(tk.Tk):
                 "summary_show_ces_pos",
                 "summary_show_ces_neg",
                 "video_summary_on_map",
+                "spectrogram_on_map",
             ):
                 if key in display and key in self._vars:
                     self._vars[key].set(bool(display[key]))
@@ -2198,6 +2227,7 @@ class App(tk.Tk):
                 "avg_activity_window",
                 "summary_depth",
                 "video_summary_height",
+                "spectrogram_depth",
             ):
                 if key in runtime and key in self._vars:
                     self._vars[key].set(runtime[key])
@@ -2332,7 +2362,7 @@ class App(tk.Tk):
             return
 
         # View transform: brain [0,1]² → canvas pixels
-        strip_h = self._brain_map_summary_strip_height(H)
+        strip_h = self._brain_map_overlay_height(H)
         map_h = max(2, H - strip_h)
         CW = W - 2 * _MARGIN
         CH = max(1.0, map_h - 2 * _MARGIN)
@@ -2427,6 +2457,7 @@ class App(tk.Tk):
                               fill="", outline="#ffffff", width=2)
         self._draw_brain_status_overlay(W, map_h)
         self._draw_activity_summary_on_brain_map(c, W, H)
+        self._draw_spectrogram_on_brain_map(c, W, H)
         self._draw_brain_average()
 
     def _draw_brain_average(self, event=None) -> None:
@@ -2980,6 +3011,7 @@ class App(tk.Tk):
         self._active_input_history.clear()
         self._ces_pos_history.clear()
         self._ces_neg_history.clear()
+        self._tes_history.clear()
         self._last_active_input_count = 0
         self._cas_charge.clear()
         self._cas_active.clear()
@@ -3759,7 +3791,7 @@ class App(tk.Tk):
         pixels = bytearray(bg * (width * height))
         if self._brain is not None:
             neurons = self._brain.substrate.brain
-            strip_h = self._brain_map_summary_strip_height(height)
+            strip_h = self._brain_map_overlay_height(height)
             map_h = max(2, height - strip_h)
             cw = width - 2 * _MARGIN
             ch = max(1.0, map_h - 2 * _MARGIN)
@@ -3780,6 +3812,7 @@ class App(tk.Tk):
                 outline, fill = self._neuron_ppm_colors(idx, neuron, output_indices)
                 self._draw_ppm_circle(pixels, width, height, int(round(cx)), int(round(cy)), radius, outline, fill)
         self._draw_ppm_activity_summary_overlay(pixels, width, height)
+        self._draw_ppm_spectrogram_overlay(pixels, width, height)
         with path.open("wb") as file:
             file.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
             file.write(pixels)
@@ -3939,6 +3972,55 @@ class App(tk.Tk):
                 y = bottom - int(round((value - vmin) / (vmax - vmin) * (bottom - top)))
                 self._draw_ppm_line(pixels, width, height, last_x, last_y, x, y, color)
                 last_x, last_y = x, y
+
+    def _draw_ppm_spectrogram_overlay(self, pixels: bytearray, width: int, height: int) -> None:
+        overlay_h = self._spectrogram_strip_height(height)
+        if overlay_h <= 0:
+            return
+        summary_h = self._brain_map_summary_strip_height(height)
+        y0 = height - summary_h - overlay_h
+        bg = (0x0d, 0x11, 0x17)
+        axis = (0x2a, 0x2a, 0x2a)
+        for y in range(y0, y0 + overlay_h):
+            for x in range(width):
+                self._set_ppm_pixel(pixels, width, height, x, y, bg)
+
+        depth = self._spectrogram_depth_value()
+        left = 42
+        right = width - 6
+        top = y0 + 1
+        bottom = y0 + overlay_h - 2
+        if right <= left or bottom <= top:
+            return
+        columns = self._tes_spectrogram_columns(
+            depth,
+            self._summary_depth_value(),
+            max_columns=min(max(1, right - left + 1), 240),
+            max_bins=min(max(2, bottom - top + 1), 128),
+        )
+        if not columns:
+            return
+        valid_columns = [column for column in columns if column]
+        if not valid_columns:
+            return
+        bin_count = len(valid_columns[0])
+        max_mag = max((mag for column in valid_columns for mag in column), default=0.0)
+        plot_w = right - left + 1
+        plot_h = bottom - top + 1
+        for col_idx, column in enumerate(columns):
+            if not column:
+                continue
+            x0 = left + int(col_idx * plot_w / len(columns))
+            x1 = left + int((col_idx + 1) * plot_w / len(columns)) - 1
+            for bin_idx, mag in enumerate(column):
+                y1 = bottom - int(bin_idx * plot_h / bin_count)
+                y_top = bottom - int((bin_idx + 1) * plot_h / bin_count) + 1
+                color = self._hex_to_rgb(self._spectrogram_color(mag, max_mag))
+                for y in range(max(top, y_top), min(bottom, y1) + 1):
+                    for x in range(max(left, x0), min(right, x1) + 1):
+                        self._set_ppm_pixel(pixels, width, height, x, y, color)
+        self._draw_ppm_line(pixels, width, height, left, top, left, bottom, axis)
+        self._draw_ppm_line(pixels, width, height, left, bottom, right, bottom, axis)
 
     def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
         text = color.lstrip("#")
@@ -4436,6 +4518,7 @@ class App(tk.Tk):
         self._active_input_history.append(float(self._last_active_input_count))
         self._ces_pos_history.append(sum(n.eq for n in active_neurons if n.eq > 0.0))
         self._ces_neg_history.append(sum(n.eq for n in active_neurons if n.eq < 0.0))
+        self._tes_history.append(self._ces_pos_history[-1] + self._ces_neg_history[-1])
         if self._cas_neuron_idx is not None and self._cas_neuron_idx < len(neurons):
             n = neurons[self._cas_neuron_idx]
             self._cas_charge.append(n.charge)
@@ -4451,6 +4534,8 @@ class App(tk.Tk):
             self._draw_cas()
         elif tab == 2:
             self._draw_act_count()
+        elif tab == 3:
+            self._draw_spectrogram()
         if self._cas_neuron_idx is not None:
             self._update_neuron_panel(self._cas_neuron_idx)
 
@@ -4516,10 +4601,160 @@ class App(tk.Tk):
             self._vars["video_summary_height"].set(height)
             return height
 
+    def _spectrogram_depth_value(self) -> int:
+        try:
+            return max(2, int(self._vars["spectrogram_depth"].get()))
+        except (tk.TclError, ValueError):
+            depth = 64
+            self._vars["spectrogram_depth"].set(depth)
+            return depth
+
+    def _spectrogram_strip_height(self, canvas_height: int) -> int:
+        if not bool(self._vars["spectrogram_on_map"].get()):
+            return 0
+        return min(max(40, self._video_summary_height_value()), max(0, canvas_height - 4))
+
+    def _brain_map_overlay_height(self, canvas_height: int) -> int:
+        return min(
+            self._brain_map_summary_strip_height(canvas_height) + self._spectrogram_strip_height(canvas_height),
+            max(0, canvas_height - 4),
+        )
+
     def _brain_map_summary_strip_height(self, canvas_height: int) -> int:
         if not bool(self._vars["video_summary_on_map"].get()):
             return 0
         return min(max(10, self._video_summary_height_value()), max(0, canvas_height - 4))
+
+    def _tes_spectrogram_columns(
+        self,
+        depth: int,
+        time_depth: int,
+        max_columns: int | None = None,
+        max_bins: int | None = None,
+    ) -> list[list[float] | None]:
+        values = [float(value) for value in self._tes_history]
+        if not values:
+            return []
+        visible_count = min(max(1, time_depth), len(values))
+        endpoint_indices = list(range(len(values) - visible_count, len(values)))
+        if max_columns is not None and len(endpoint_indices) > max_columns:
+            count = max(1, max_columns)
+            endpoint_indices = [
+                endpoint_indices[int(round(i * (len(endpoint_indices) - 1) / (count - 1)))]
+                for i in range(count)
+            ] if count > 1 else [endpoint_indices[-1]]
+
+        columns: list[list[float] | None] = []
+        full_bin_count = depth // 2 + 1
+        if max_bins is None or max_bins >= full_bin_count:
+            freq_indices = list(range(full_bin_count))
+        else:
+            bin_count = max(2, max_bins)
+            freq_indices = [
+                int(round(i * (full_bin_count - 1) / (bin_count - 1)))
+                for i in range(bin_count)
+            ]
+        for endpoint in endpoint_indices:
+            start = endpoint - depth + 1
+            if start < 0:
+                columns.append(None)
+                continue
+            window = values[start:start + depth]
+            mean = sum(window) / depth
+            centered = [value - mean for value in window]
+            mags: list[float] = []
+            for freq in freq_indices:
+                real = 0.0
+                imag = 0.0
+                for n, value in enumerate(centered):
+                    angle = 2.0 * math.pi * freq * n / depth
+                    real += value * math.cos(angle)
+                    imag -= value * math.sin(angle)
+                mags.append(math.hypot(real, imag) / depth)
+            columns.append(mags)
+        return columns
+
+    def _spectrogram_color(self, value: float, max_value: float) -> str:
+        if max_value <= 0.0:
+            level = 0.0
+        else:
+            level = math.log1p(value) / math.log1p(max_value)
+        level = min(1.0, max(0.0, level))
+        if level < 0.5:
+            t = level / 0.5
+            r = int(0x0d + (0x38 - 0x0d) * t)
+            g = int(0x11 + (0xbd - 0x11) * t)
+            b = int(0x17 + (0xf8 - 0x17) * t)
+        else:
+            t = (level - 0.5) / 0.5
+            r = int(0x38 + (0xfa - 0x38) * t)
+            g = int(0xbd + (0xcc - 0xbd) * t)
+            b = int(0xf8 + (0x15 - 0xf8) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_spectrogram_heatmap(
+        self,
+        c: tk.Canvas,
+        x0: int,
+        y0: int,
+        w: int,
+        h: int,
+        *,
+        show_labels: bool,
+    ) -> None:
+        c.create_rectangle(x0, y0, x0 + w, y0 + h, fill="#0d1117", outline="#2a2a2a")
+        depth = self._spectrogram_depth_value()
+        ML, MR = 42, 6
+        MT, MB = (18, 12) if show_labels else (1, 1)
+        ax = x0 + ML
+        ay0 = y0 + MT
+        ay1 = y0 + h - MB
+        aw = max(x0 + w - MR - ax, 1)
+        ah = max(ay1 - ay0, 1)
+        max_columns = min(max(1, aw), 240)
+        max_bins = min(max(2, ah), 128)
+        columns = self._tes_spectrogram_columns(
+            depth,
+            self._summary_depth_value(),
+            max_columns=max_columns,
+            max_bins=max_bins,
+        )
+        if not columns:
+            label = f"Need at least D={depth} TES periods"
+            c.create_text(x0 + w // 2, y0 + h // 2, text=label, fill="#555", font=("Courier", 9))
+            return
+
+        valid_columns = [column for column in columns if column]
+        if not valid_columns:
+            label = f"Need at least D={depth} TES periods"
+            c.create_text(x0 + w // 2, y0 + h // 2, text=label, fill="#555", font=("Courier", 9))
+            return
+
+        bin_count = len(valid_columns[0])
+        max_mag = max((mag for column in valid_columns for mag in column), default=0.0)
+        col_w = max(1.0, aw / len(columns))
+        row_h = max(1.0, ah / bin_count)
+        for col_idx, column in enumerate(columns):
+            if not column:
+                continue
+            x_left = ax + col_idx * col_w
+            x_right = ax + (col_idx + 1) * col_w
+            for bin_idx, mag in enumerate(column):
+                y_bottom = ay1 - bin_idx * row_h
+                y_top = ay1 - (bin_idx + 1) * row_h
+                c.create_rectangle(
+                    x_left,
+                    y_top,
+                    x_right + 1,
+                    y_bottom + 1,
+                    fill=self._spectrogram_color(mag, max_mag),
+                    outline="",
+                )
+        c.create_rectangle(ax, ay0, ax + aw, ay1, fill="", outline="#2a2a2a")
+        if show_labels:
+            c.create_text(ax + 4, y0 + 2, text=f"TES spectrogram  D={depth}", fill="#9fb8c8", font=("Courier", 8), anchor="nw")
+            c.create_text(ax - 4, ay0, text=f"{bin_count - 1}", fill="#555", font=("Courier", 7), anchor="e")
+            c.create_text(ax - 4, ay1, text="0", fill="#555", font=("Courier", 7), anchor="e")
 
     def _activity_summary_series(self, depth: int) -> list[tuple[list[float], str, str]]:
         series: list[tuple[list[float], str, str]] = []
@@ -4542,6 +4777,14 @@ class App(tk.Tk):
         y0 = height - overlay_h
         c.create_rectangle(0, y0, width, height, fill="#0d1117", outline="#2a2a2a")
         self._plot_summary(c, self._activity_summary_series(self._summary_depth_value()), 0, y0, width, overlay_h)
+
+    def _draw_spectrogram_on_brain_map(self, c: tk.Canvas, width: int, height: int) -> None:
+        overlay_h = self._spectrogram_strip_height(height)
+        if overlay_h <= 0:
+            return
+        summary_h = self._brain_map_summary_strip_height(height)
+        y0 = height - summary_h - overlay_h
+        self._draw_spectrogram_heatmap(c, 0, y0, width, overlay_h, show_labels=False)
 
     def _plot_summary(
         self,
@@ -4625,6 +4868,19 @@ class App(tk.Tk):
             return
         c.delete("all")
         self._plot_summary(c, self._activity_summary_series(self._summary_depth_value()), 0, 0, W, H)
+
+    def _draw_synced_activity_views(self) -> None:
+        self._draw_act_count()
+        self._draw_spectrogram()
+        self._draw_brain()
+
+    def _draw_spectrogram(self, event=None) -> None:
+        c = self._spectrogram_canvas
+        W, H = c.winfo_width(), c.winfo_height()
+        if W <= 1 or H <= 1:
+            return
+        c.delete("all")
+        self._draw_spectrogram_heatmap(c, 0, 0, W, H, show_labels=True)
 
     def _on_close(self) -> None:
         self._log("Application closing")
