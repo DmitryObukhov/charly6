@@ -114,6 +114,7 @@ DEFAULT_VISUALIZATION_CONFIG: dict = {
     "display": {
         "show_seq_lines": False,
         "circle_radius": 3,
+        "eq_outline_threshold_percent": 0.1,
     },
     "runtime": {
         "tick_ms": 100,
@@ -392,6 +393,7 @@ class App(tk.Tk):
         self._vars["video_file"] = tk.StringVar(value="")
         self._vars["video_summary_on_map"] = tk.BooleanVar(value=False)
         self._vars["video_summary_height"] = tk.IntVar(value=40)
+        self._vars["eq_outline_threshold_percent"] = tk.DoubleVar(value=0.1)
         self._brain: Brain | None = None
         self._brain_id: str | None = None
         self._runtime_active_overrides: dict[int, bool] = {}
@@ -402,11 +404,13 @@ class App(tk.Tk):
         self._input_specs: list[dict] = []
         self._output_specs: list[dict] = []
         self._body: Body | None = None
+        self._active_physical_input_indices: set[int] = set()
         self._last_active_input_indices: list[list[int]] = []
         self._input_value_vars: dict[str, tk.StringVar] = {}
         self._output_value_vars: dict[str, tk.StringVar] = {}
         self._inputs_editor_frame: ttk.Frame | None = None
         self._head_size: int = 0
+        self._brain_total_input: float = 1000.0
         self._seq_cursor: int = 0
         self._seq_window: list[int] = []   # indices active in current brightness window
         self._seq_running: bool = False
@@ -555,6 +559,17 @@ class App(tk.Tk):
 
         brain_map_tab = ttk.Frame(self._brain_top_nb)
         self._brain_top_nb.add(brain_map_tab, text=" Brain Map ")
+        map_controls = ttk.Frame(brain_map_tab)
+        map_controls.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
+        ttk.Label(map_controls, text="EQ outline %").pack(side=tk.LEFT, padx=(0, 4))
+        self._eq_outline_threshold_entry = ttk.Entry(
+            map_controls,
+            textvariable=self._vars["eq_outline_threshold_percent"],
+            width=7,
+        )
+        self._eq_outline_threshold_entry.pack(side=tk.LEFT)
+        self._eq_outline_threshold_entry.bind("<Return>", lambda _event: self._on_eq_outline_threshold_changed())
+        self._eq_outline_threshold_entry.bind("<FocusOut>", lambda _event: self._on_eq_outline_threshold_changed())
         self._brain_canvas = tk.Canvas(brain_map_tab, bg="#0d1117")
         self._brain_canvas.pack(fill=tk.BOTH, expand=True)
         self._brain_canvas.bind("<Configure>",      self._on_brain_resize)
@@ -1656,6 +1671,7 @@ class App(tk.Tk):
             "display": {
                 "show_seq_lines": bool(self._vars["show_seq_lines"].get()),
                 "circle_radius": self._circle_radius,
+                "eq_outline_threshold_percent": self._eq_outline_threshold_percent(),
                 "summary_show_active": bool(self._vars["summary_show_active"].get()),
                 "summary_show_inputs": bool(self._vars["summary_show_inputs"].get()),
                 "summary_show_ces_pos": bool(self._vars["summary_show_ces_pos"].get()),
@@ -2157,6 +2173,13 @@ class App(tk.Tk):
                 self._circle_radius = max(0.5, float(display["circle_radius"]))
             except (TypeError, ValueError):
                 pass
+        if isinstance(display, dict) and "eq_outline_threshold_percent" in display:
+            try:
+                self._vars["eq_outline_threshold_percent"].set(
+                    max(0.0, float(display["eq_outline_threshold_percent"]))
+                )
+            except (tk.TclError, TypeError, ValueError):
+                pass
         if isinstance(display, dict):
             for key in (
                 "summary_show_active",
@@ -2188,6 +2211,11 @@ class App(tk.Tk):
                     self._circle_radius = max(0.5, float(value))
                 except (TypeError, ValueError):
                     pass
+            elif key == "eq_outline_threshold_percent":
+                try:
+                    self._vars["eq_outline_threshold_percent"].set(max(0.0, float(value)))
+                except (tk.TclError, TypeError, ValueError):
+                    pass
             elif key in self._vars:
                 try:
                     self._vars[key].set(value)
@@ -2201,6 +2229,59 @@ class App(tk.Tk):
 
     def _on_world_resize(self, event: tk.Event) -> None:
         self._draw_world()
+
+    def _on_eq_outline_threshold_changed(self) -> None:
+        threshold = self._eq_outline_threshold_percent()
+        self._vars["eq_outline_threshold_percent"].set(threshold)
+        self._save_config(CONFIG_PATH)
+        self._draw_brain()
+
+    def _eq_outline_threshold_percent(self) -> float:
+        try:
+            return max(0.0, float(self._vars["eq_outline_threshold_percent"].get()))
+        except (tk.TclError, TypeError, ValueError):
+            threshold = 0.1
+            self._vars["eq_outline_threshold_percent"].set(threshold)
+            return threshold
+
+    def _neuron_output_indices(self) -> set[int]:
+        output_indices: set[int] = set()
+        if self._brain is None:
+            return output_indices
+        neuron_count = len(self._brain.substrate.brain)
+        for spec in self._output_specs:
+            output_indices.update(idx for idx in spec.get("indices", []) if 0 <= idx < neuron_count)
+        return output_indices
+
+    def _neuron_is_high_eq(self, neuron) -> bool:
+        total_input = abs(float(self._brain_total_input))
+        if total_input <= 0.0:
+            return False
+        eq_percent = abs(float(neuron.eq)) / total_input * 100.0
+        return eq_percent > self._eq_outline_threshold_percent()
+
+    def _neuron_canvas_colors(self, idx: int, neuron, output_indices: set[int]) -> tuple[str, str]:
+        active_input = idx in self._active_physical_input_indices
+        if idx in self._input_indices:
+            outline = "#38bdf8" if active_input else "#2563eb"
+        elif idx in output_indices:
+            outline = "#facc15"
+        elif self._neuron_is_high_eq(neuron):
+            outline = "#22cc55" if neuron.eq >= 0.0 else "#cc2222"
+        else:
+            outline = "#4b5563"
+
+        if active_input:
+            fill = "#38bdf8"
+        elif neuron.active:
+            fill = "#22cc55" if neuron.eq >= 0.0 else "#cc2222"
+        else:
+            fill = "#2a2a2a"
+        return outline, fill
+
+    def _neuron_ppm_colors(self, idx: int, neuron, output_indices: set[int]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        outline_hex, fill_hex = self._neuron_canvas_colors(idx, neuron, output_indices)
+        return self._hex_to_rgb(outline_hex), self._hex_to_rgb(fill_hex)
 
     def _draw_world(self) -> None:
         c = self._world_canvas
@@ -2302,6 +2383,7 @@ class App(tk.Tk):
         # O(1) window-position lookup; brightness 10 % (oldest) → 100 % (newest)
         win_pos = {idx: wpos for wpos, idx in enumerate(self._seq_window)}
         M = len(self._seq_window)
+        output_indices = self._neuron_output_indices()
 
         for i, ((px, py), neuron) in enumerate(zip(self._positions, neurons)):
             cx, cy = tc(px, py)
@@ -2318,28 +2400,16 @@ class App(tk.Tk):
                 win_color = None
 
             r = self._circle_radius
-            if i < self._head_size:
-                if i in self._input_indices:
-                    color = "#74c7ff" if neuron.active else "#0b2447"
-                elif win_color:
-                    color = win_color
-                elif neuron.active:
-                    color = "#22cc55" if neuron.eq >= 0.0 else "#cc2222"
-                else:
-                    color = "#3a3a3a"
-                fill = color if neuron.active else ""
-                c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=color, width=1)
-            else:
-                if i in self._input_indices:
-                    color = "#74c7ff" if neuron.active else "#0b2447"
-                elif win_color:
-                    color = win_color
-                elif neuron.active:
-                    color = "#22cc55" if neuron.eq >= 0.0 else "#cc2222"
-                else:
-                    color = "#3a3a3a"
-                fill = color if neuron.active else ""
-                c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=color, width=1)
+            outline, fill = self._neuron_canvas_colors(i, neuron, output_indices)
+            outline_width = 2 if i in self._active_physical_input_indices else 1
+            tags = ("neuron", f"neuron:{i}")
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=outline, width=outline_width, tags=tags)
+            if win_color:
+                seq_r = max(r + 2, 3.0)
+                c.create_oval(
+                    cx - seq_r, cy - seq_r, cx + seq_r, cy + seq_r,
+                    fill="", outline=win_color, width=1, tags=tags
+                )
 
         # Highlight rings drawn on top of neurons
         hi = self._highlight_neuron_idx
@@ -2500,7 +2570,9 @@ class App(tk.Tk):
         """Single click — select neuron and show its info without changing state."""
         if not self._brain:
             return
-        idx = self._nearest_neuron_at(event.x, event.y)
+        idx = self._neuron_idx_from_canvas_event(event)
+        if idx is None:
+            idx = self._nearest_neuron_at(event.x, event.y)
         if idx is None:
             self._clear_neuron_selection()
             return
@@ -2525,7 +2597,9 @@ class App(tk.Tk):
         """Right-click — toggle clicked neuron's active state; selection unchanged."""
         if not self._brain:
             return
-        idx = self._nearest_neuron_at(event.x, event.y)
+        idx = self._neuron_idx_from_canvas_event(event)
+        if idx is None:
+            idx = self._nearest_neuron_at(event.x, event.y)
         if idx is None:
             return
         neu = self._brain.substrate.brain[idx]
@@ -2545,6 +2619,25 @@ class App(tk.Tk):
             ))
 
     # ── Head sequence controls ────────────────────────────────────────────────
+
+    def _neuron_idx_from_canvas_event(self, event: tk.Event) -> int | None:
+        if not self._brain:
+            return None
+        item_ids = list(event.widget.find_withtag("current"))
+        if not item_ids:
+            pad = max(2.0, self._circle_radius + 1.0)
+            item_ids = list(event.widget.find_overlapping(event.x - pad, event.y - pad, event.x + pad, event.y + pad))
+        for item_id in reversed(item_ids):
+            for tag in event.widget.gettags(item_id):
+                if not tag.startswith("neuron:"):
+                    continue
+                try:
+                    idx = int(tag.split(":", 1)[1])
+                except ValueError:
+                    return None
+                if 0 <= idx < len(self._brain.substrate.brain):
+                    return idx
+        return None
 
     def _neuron_counts(self, idx: int) -> tuple[int, int]:
         ic = self._in_counts[idx] if idx < len(self._in_counts) else 0
@@ -2871,7 +2964,9 @@ class App(tk.Tk):
         self._input_specs = input_specs
         self._output_specs = output_specs
         self._body = body
+        self._active_physical_input_indices = set()
         self._last_active_input_indices = [[] for _ in brain.substrate.brain]
+        self._brain_total_input = total_in
         self._input_value_vars = {}
         self._output_value_vars = {}
         self._adj_in = adj_in
@@ -3317,6 +3412,8 @@ class App(tk.Tk):
         spec["value"] = translation.value
         neurons = self._brain.substrate.brain
         active_indices = set(translation.indices)
+        self._active_physical_input_indices.difference_update(spec["indices"])
+        self._active_physical_input_indices.update(active_indices)
         positive_lines: list[str] = []
         negative_example: str | None = None
         negative_example_uses_valid_target = False
@@ -3675,20 +3772,13 @@ class App(tk.Tk):
                 )
 
             radius = max(1, int(round(self._circle_radius)))
+            output_indices = self._neuron_output_indices()
             for idx, ((px, py), neuron) in enumerate(zip(self._positions, neurons)):
                 cx, cy = tc(px, py)
                 if cx < -radius or cx >= width + radius or cy < -radius or cy >= map_h + radius:
                     continue
-                if idx in self._input_indices:
-                    color = (0x74, 0xc7, 0xff) if neuron.active else (0x0b, 0x24, 0x47)
-                    fill = neuron.active
-                elif neuron.active:
-                    color = (0x22, 0xcc, 0x55) if neuron.eq >= 0.0 else (0xcc, 0x22, 0x22)
-                    fill = True
-                else:
-                    color = (0x3a, 0x3a, 0x3a)
-                    fill = False
-                self._draw_ppm_circle(pixels, width, height, int(round(cx)), int(round(cy)), radius, color, fill)
+                outline, fill = self._neuron_ppm_colors(idx, neuron, output_indices)
+                self._draw_ppm_circle(pixels, width, height, int(round(cx)), int(round(cy)), radius, outline, fill)
         self._draw_ppm_activity_summary_overlay(pixels, width, height)
         with path.open("wb") as file:
             file.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
@@ -3786,8 +3876,8 @@ class App(tk.Tk):
         cx: int,
         cy: int,
         radius: int,
-        color: tuple[int, int, int],
-        fill: bool,
+        outline_color: tuple[int, int, int],
+        fill_color: tuple[int, int, int],
     ) -> None:
         radius2 = radius * radius
         inner2 = max(0, (radius - 1) * (radius - 1))
@@ -3796,9 +3886,10 @@ class App(tk.Tk):
             for x in range(max(0, cx - radius), min(width, cx + radius + 1)):
                 dx = x - cx
                 d2 = dx * dx + dy * dy
-                if d2 > radius2 or (not fill and d2 < inner2):
+                if d2 > radius2:
                     continue
                 offset = (y * width + x) * 3
+                color = fill_color if d2 < inner2 else outline_color
                 pixels[offset:offset + 3] = bytes(color)
 
     def _draw_ppm_activity_summary_overlay(self, pixels: bytearray, width: int, height: int) -> None:
