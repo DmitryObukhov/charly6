@@ -1,10 +1,21 @@
-tab: 2
+tab: 0
 visualization:
   display:
     show_seq_lines: false
     circle_radius: 3.0
+    eq_outline_threshold_percent: 0.1
+    summary_show_active: true
+    summary_show_inputs: true
+    summary_show_ces_pos: true
+    summary_show_ces_neg: true
+    video_summary_on_map: false
+    spectrogram_on_map: false
   runtime:
     tick_ms: 100
     max_iter: 0
     seq_window: 9
-last_yaml: C:\PROJECT_42\__dev\Charly6\current.yaml
+    avg_activity_window: 100
+    summary_depth: 1000
+    video_summary_height: 40
+    spectrogram_depth: 64
+last_yaml: C:\PROJECT_42\__dev\Charly6\newbrain.yaml

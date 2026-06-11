@@ -4100,9 +4100,16 @@ class App(tk.Tk):
 
         # 1. Read values from physical model and update io table and input value vars
         world_outputs = self._read_physical_model_values()
-        light_val = math.sin(self._iteration * 0.1) * 55 + 55
-        hunger_val = (math.cos(self._iteration * 0.05) + 1) * 50
-        world_outputs = {'velocity': 0.5, 'hunger': hunger_val, 'light': light_val }
+        # light_val = math.sin(self._iteration * 0.1) * 55 + 55
+        # hunger_val = (math.cos(self._iteration * 0.05) + 1) * 50
+        # world_outputs = {'velocity': 0.5, 'hunger': hunger_val, 'light': light_val }
+
+        # world_outputs = {}        
+        # world_outputs['foodSmell'] = 0.0
+        # world_outputs['waterSmell'] = 0.0
+        # world_outputs['lightLux'] = math.sin(self._iteration * 0.1) * 55 + 55
+        # world_outputs['wallImpact'] = 20.0 if self._iteration % 20 < 10 else 0.0
+
 
         # 2. Apply input values to neurons (body translation and logging)
         self._apply_physical_outputs_to_input_neurons(world_outputs)

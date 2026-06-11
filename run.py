@@ -7,3 +7,4 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from charly6.app import main
 
 main()
+# + 38 068 824 10 02

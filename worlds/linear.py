@@ -7,6 +7,7 @@ world modules can be loaded with the same external contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import yaml
@@ -161,16 +162,23 @@ def Process(inputs: dict[str, float] | None) -> dict[str, float]:
     if cfg.max_steps is not None and state.step >= cfg.max_steps:
         return _collect_outputs(cfg, state)
 
+    print(f"Step {state.step}: x={state.x:.2f}, velocity={state.velocity:.2f}, stomach={state.stomach_content:.2f}")
+    for name, value in normalized.items():
+        print(f"  Input {name}: {value:.2f}")
     left_force = cfg.inputs["left_motor"].physical_value(normalized["left_motor"])
     right_force = cfg.inputs["right_motor"].physical_value(normalized["right_motor"])
     force = right_force - left_force
     drag_force = -state.velocity * cfg.drag
     acceleration = (force + drag_force) / cfg.mass
-
     state.velocity += acceleration * cfg.dt
     state.x += state.velocity * cfg.dt
     state.stomach_content = max(0.0, state.stomach_content - cfg.stomach_decay * cfg.dt)
+
+
     _resolve_bounds(cfg, state)
+
+
+
     state.time += cfg.dt
     state.step += 1
     return _collect_outputs(cfg, state)
@@ -395,7 +403,9 @@ def _resolve_bounds(cfg: WorldConfig, state: WorldState) -> None:
 def _collect_outputs(cfg: WorldConfig, state: WorldState) -> dict[str, float]:
     if not cfg.outputs:
         return {"x": state.x, "velocity": state.velocity}
-    lightness = _lightness_at_agent(cfg, state)
+    #debug
+    # lightness = _lightness_at_agent(cfg, state)
+    lightness = math.cos(state.time / 100) * 5 + 5
     values = {
         "x": state.x,
         "velocity": state.velocity,
