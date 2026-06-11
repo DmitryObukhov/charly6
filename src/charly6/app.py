@@ -467,7 +467,7 @@ class App(tk.Tk):
         self._build_menu()
         self._build_layout()
         self._log(f"Opened log {self._log_path}")
-        self.state('zoomed')
+        self.attributes('-zoomed', True)
         self._load_config(CONFIG_PATH)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
