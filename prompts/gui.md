@@ -6,6 +6,20 @@ Define the Charly6 Tkinter GUI visualization behavior. GUI code may inspect
 brain, body, world, and runtime history state, but must not change the public
 brain, neuron, or world plugin APIs.
 
+## Window Startup
+
+The main window should open maximized when the platform supports it, but Tk
+window-manager capabilities differ across Windows, Linux, and desktop
+environments. Do not call a single maximize API without handling `tk.TclError`.
+
+Use a fallback sequence:
+
+- `state("zoomed")`
+- `attributes("-zoomed", True)`
+- fixed startup geometry such as `1400x850+0+0`
+
+Startup must not fail if a specific Tk maximize attribute is unsupported.
+
 ## Brain Map Neuron Rendering
 
 Neurons are drawn as circles. Circle outline encodes neuron role; circle fill

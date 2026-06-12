@@ -467,7 +467,7 @@ class App(tk.Tk):
         self._build_menu()
         self._build_layout()
         self._log(f"Opened log {self._log_path}")
-        self.attributes('-zoomed', True)
+        self._maximize_window()
         self._load_config(CONFIG_PATH)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -482,6 +482,19 @@ class App(tk.Tk):
         if not plugins:
             raise RuntimeError("No world plugins with GetDefaultConfig found.")
         return dict(sorted(plugins.items()))
+
+    def _maximize_window(self) -> None:
+        try:
+            self.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        self.geometry("1400x850+0+0")
 
     def _world_module_name_from_config(self, cfg: dict) -> str | None:
         section = cfg.get("world", {})
